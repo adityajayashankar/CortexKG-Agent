@@ -11,7 +11,7 @@ ask_model() accepts an optional 'layer' hint to set context for the model.
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
-MODEL_PATH = "your-username/vuln-mistral-7b"  # or local: "./checkpoints/vuln-mistral-7b/merged"
+MODEL_PATH = "adityajayashankar/vuln-mistral-7b"  # or local: "./checkpoints/vuln-mistral-7b/merged"
 
 # ── Layer system prompts ───────────────────────────────────────────────────
 # Match the layers in training_pairs.jsonl so the model knows its role.

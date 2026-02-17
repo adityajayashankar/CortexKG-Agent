@@ -25,7 +25,7 @@ from trl import SFTTrainer, SFTConfig
 BASE_MODEL    = "mistralai/Mistral-7B-Instruct-v0.3"
 DATASET_PATH  = "data/training_pairs.jsonl"
 OUTPUT_DIR    = "./checkpoints/vuln-mistral-7b"
-HF_REPO_NAME  = "your-username/vuln-mistral-7b"   # ← change this
+HF_REPO_NAME  = "adityajayashankar/vuln-mistral-7b"   # ← change this
 
 # ── Prompt format ──────────────────────────────────────────────────────────
 # Must match exactly what agent/tools use at inference time.
