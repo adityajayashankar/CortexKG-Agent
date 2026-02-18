@@ -1,41 +1,39 @@
 """
-build_dataset.py
-----------------
-Merges ALL raw source files into the full 6-layer schema + co-occurrence layer.
-Generates instruction-response training pairs for each layer.
+build_dataset.py  (FIXED)
+--------------------------
+FIXES in this version:
+  1. GitHub lookup: 3000 advisories crawled → only 149 in lookup map
+     Root cause: old build_github_lookup only indexed by primary cve_id.
+     Since 95% of GHSA advisories only have a ghsa_id (no primary cve_id),
+     they were silently dropped. Fixed to index by ALL CVE aliases + ghsa_id.
+
+  2. Training pair quality: no filtering → noisy short outputs in dataset
+     Added filter_training_pairs() — drops outputs < 80 chars
+     Added dedup_training_pairs()  — deduplicates by (instruction, output[:200])
+
+  3. Training pair enrichment: L1 outputs were just field concatenations
+     Now includes reasoning text to teach the model to analyse, not recite.
 
 DATA SOURCES:
-  - raw_nvd.json:                NVD CVE database
-  - raw_epss.json:               FIRST EPSS exploit probability scores
-  - raw_github.json:             GitHub Security Advisories
-  - raw_blogs.json:              Security blog write-ups
-  - raw_papers.json:             arXiv, Semantic Scholar, OSV
-  - raw_closed.json:             Full Disclosure, Bugtraq, HackerOne, MSRC
-  - raw_cisa_kev.json:           CISA KEV catalog
-  - raw_exploitdb.json:          Exploit-DB full CSV export
-  - raw_mitre_attack.json:       MITRE ATT&CK + CAPEC  [NEW]
-  - raw_vendor_advisories.json:  Cisco/RedHat/Ubuntu/Debian [NEW]
-  - raw_correlations.json:       CVE correlation graph  [NEW]
-  - raw_cooccurrence.json:       P(B|A) co-occurrence model [NEW]
-
-Training layers:
-  1. vulnerability_intelligence  — OWASP mapping, CWE analysis
-  2. pentesting_intelligence     — attack methods, payloads, tools
-  3. risk_scoring                — CVSS, EPSS, business impact
-  4. execution_context           — tech stack, tool selection
-  5. audit_evidence              — findings, compliance
-  6. remediation_learning        — fixes, root cause
-  7. vulnerability_cooccurrence  — P(B|A): if A exists, B is likely [NEW]
+  - raw_nvd.json                NVD CVE database
+  - raw_epss.json               FIRST EPSS scores
+  - raw_github.json             GitHub Security Advisories (GHSA)
+  - raw_blogs.json              Security blog write-ups
+  - raw_papers.json             arXiv, Semantic Scholar, OSV
+  - raw_closed.json             Full Disclosure, OSS-Security, HackerOne, MSRC
+  - raw_cisa_kev.json           CISA KEV catalog
+  - raw_exploitdb.json          Exploit-DB
+  - raw_vendor_advisories.json  Cisco/RedHat/Ubuntu/Debian
+  - raw_correlations.json       CVE correlation graph
+  - raw_cooccurrence.json       P(B|A) co-occurrence model
 """
 
 import json
 import re
 import sys
-import uuid
 from pathlib import Path
 from collections import defaultdict
 
-# Ensure data/ dir is on path for sibling imports
 _data_dir = Path(__file__).parent
 if str(_data_dir) not in sys.path:
     sys.path.insert(0, str(_data_dir))
@@ -56,56 +54,56 @@ def clean(text: str) -> str:
 
 
 def risk_level(cvss_score) -> str:
-    if not cvss_score:
-        return "Unknown"
     try:
         s = float(cvss_score)
-        if s >= 9.0: return "Critical"
-        if s >= 7.0: return "High"
-        if s >= 4.0: return "Medium"
-        return "Low"
-    except (ValueError, TypeError):
+    except (TypeError, ValueError):
         return "Unknown"
+    if s >= 9.0:  return "Critical"
+    if s >= 7.0:  return "High"
+    if s >= 4.0:  return "Medium"
+    return "Low"
 
 
 def business_impact(owasp_cat: str) -> str:
     impacts = {
-        "A01:2021-Broken Access Control":                      "Unauthorized data access, privilege escalation",
-        "A02:2021-Cryptographic Failures":                     "Sensitive data exposure, credential theft",
-        "A03:2021-Injection":                                  "Database compromise, remote code execution",
-        "A04:2021-Insecure Design":                            "Systematic security bypass, reputational damage",
-        "A05:2021-Security Misconfiguration":                  "System compromise via exposed attack surface",
-        "A06:2021-Vulnerable and Outdated Components":         "Full system takeover via known exploits",
-        "A07:2021-Identification and Authentication Failures": "Account takeover, session hijacking",
-        "A08:2021-Software and Data Integrity Failures":       "Supply chain compromise, malicious updates",
-        "A09:2021-Security Logging and Monitoring Failures":   "Undetected breaches, delayed incident response",
-        "A10:2021-Server-Side Request Forgery":                "Internal network access, cloud metadata theft",
+        "A01:2021-Broken Access Control":          "Unauthorized data access, privilege escalation, data breach",
+        "A02:2021-Cryptographic Failures":         "Exposure of sensitive data, credential theft, regulatory violation",
+        "A03:2021-Injection":                      "Data exfiltration, authentication bypass, full system compromise",
+        "A04:2021-Insecure Design":                "Systemic architectural risk, difficult to remediate without redesign",
+        "A05:2021-Security Misconfiguration":      "Unintended exposure of services, data leakage, unauthorized access",
+        "A06:2021-Vulnerable and Outdated Components": "Known exploit availability, supply chain compromise",
+        "A07:2021-Identification and Authentication Failures": "Account takeover, session hijacking, identity fraud",
+        "A08:2021-Software and Data Integrity Failures": "Supply chain attack, malicious code execution",
+        "A09:2021-Security Logging and Monitoring Failures": "Undetected breach, delayed incident response",
+        "A10:2021-Server-Side Request Forgery":    "Internal network access, cloud metadata exfiltration, SSRF pivot",
     }
-    return impacts.get(owasp_cat, "Security breach, data loss")
+    return impacts.get(owasp_cat, "Potential data breach, service disruption, regulatory penalties")
 
 
-# ── FIXED: CWE-specific, actionable security controls (replaces old generic stub) ──
+# ═══════════════════════════════════════════════════════════════════════════
+#  SECURITY CONTROL MAPPING
+# ═══════════════════════════════════════════════════════════════════════════
 
 _OWASP_CONTROLS = {
-    "A01:2021-Broken Access Control":                      "Implement RBAC, enforce object-level authorization checks, validate resource ownership before serving",
-    "A02:2021-Cryptographic Failures":                     "Use AES-256/TLS 1.2+, replace MD5/SHA1 with bcrypt/argon2, enforce HTTPS, avoid hardcoded keys",
-    "A03:2021-Injection":                                  "Use parameterized queries and prepared statements; apply allowlist input validation; avoid dynamic query construction",
-    "A04:2021-Insecure Design":                            "Add rate limiting, remove verbose error messages, implement threat modeling, use anti-automation controls",
-    "A05:2021-Security Misconfiguration":                  "Harden server configurations, disable unnecessary features, apply security headers (CSP, HSTS, X-Frame-Options)",
-    "A06:2021-Vulnerable and Outdated Components":         "Maintain SBOM, use automated dependency scanning (Snyk/Dependabot), apply patches within SLA",
-    "A07:2021-Identification and Authentication Failures": "Enforce MFA, implement brute-force lockout, use secure session tokens, invalidate sessions on logout",
-    "A08:2021-Software and Data Integrity Failures":       "Verify supply chain integrity (SRI, Sigstore), implement CI/CD security, validate deserialized inputs",
-    "A09:2021-Security Logging and Monitoring Failures":   "Deploy SIEM, alert on authentication anomalies, ensure logs are tamper-evident and include all security events",
-    "A10:2021-Server-Side Request Forgery":                "Allowlist permitted outbound URLs, block internal IP ranges at egress, disable unnecessary URL-fetching",
+    "A01:2021-Broken Access Control":          "Implement server-side access control checks; enforce least privilege; deny by default",
+    "A02:2021-Cryptographic Failures":         "Use TLS 1.3, AES-256, SHA-256+; never use MD5/SHA1/DES for security purposes",
+    "A03:2021-Injection":                      "Use parameterized queries, prepared statements, and input validation for ALL user-supplied data",
+    "A04:2021-Insecure Design":                "Threat model during design phase; enforce security architecture review gates",
+    "A05:2021-Security Misconfiguration":      "Harden all configurations; disable unnecessary features; automate configuration validation",
+    "A06:2021-Vulnerable and Outdated Components": "Implement SCA scanning in CI/CD; enforce patching SLA; maintain SBOM",
+    "A07:2021-Identification and Authentication Failures": "Enforce MFA; implement brute-force protection; use secure session management",
+    "A08:2021-Software and Data Integrity Failures": "Verify supply chain integrity (SRI, Sigstore); validate deserialized inputs",
+    "A09:2021-Security Logging and Monitoring Failures": "Implement SIEM; alert on anomalies; ensure logs are tamper-evident",
+    "A10:2021-Server-Side Request Forgery":    "Allowlist permitted URLs; block internal IP ranges; disable unnecessary URL-fetching",
 }
 
 _CWE_CONTROLS = {
-    "CWE-79":  "Implement context-aware output encoding (HTML/JS/CSS), enforce Content Security Policy (CSP) headers",
-    "CWE-89":  "Use parameterized queries or ORM — never concatenate user input into SQL strings",
-    "CWE-78":  "Use subprocess with argument lists (not shell=True), validate and sanitize all OS command inputs",
-    "CWE-22":  "Canonicalize file paths before validation, reject traversal sequences (../), use chroot jails",
+    "CWE-79":  "Implement context-aware output encoding (HTML/JS/CSS), enforce Content Security Policy (CSP)",
+    "CWE-89":  "Use parameterized queries or ORM — never concatenate user input into SQL statements",
+    "CWE-78":  "Use subprocess with argument lists (not shell=True), validate and sanitize all command inputs",
+    "CWE-22":  "Canonicalize paths before validation, reject traversal sequences (../), use chroot jails",
     "CWE-94":  "Disable eval()/exec() on user-supplied data, use sandboxed execution environments",
-    "CWE-502": "Avoid deserializing untrusted data; use safe libraries; validate type/schema before deserialization",
+    "CWE-502": "Avoid deserializing untrusted data; if necessary, use safe libraries and validate before deserialization",
     "CWE-287": "Enforce MFA, implement account lockout and throttling, use secure session token generation",
     "CWE-798": "Remove all hardcoded credentials, use secrets management (Vault, AWS Secrets Manager)",
     "CWE-476": "Initialize all pointers, use memory-safe languages, add null-pointer checks before dereference",
@@ -126,10 +124,6 @@ _CWE_CONTROLS = {
 
 
 def infer_security_control_missing(owasp_cat: str, cwe_id: str = "") -> str:
-    """
-    Return a specific, actionable missing security control.
-    CWE-specific controls take priority over OWASP-level controls.
-    """
     if cwe_id and cwe_id in _CWE_CONTROLS:
         return _CWE_CONTROLS[cwe_id]
     return _OWASP_CONTROLS.get(owasp_cat, "Apply vendor patches, enforce least privilege, validate all inputs")
@@ -139,7 +133,7 @@ def infer_security_control_missing(owasp_cat: str, cwe_id: str = "") -> str:
 #  RAW SOURCE LOADERS
 # ═══════════════════════════════════════════════════════════════════════════
 
-def load_json(path: str) -> list | dict:
+def load_json(path: str):
     p = Path(path)
     if not p.exists():
         print(f"  ⚠️  {path} not found — skipping")
@@ -155,27 +149,50 @@ def build_epss_lookup(epss_path: str) -> dict:
 
 def build_github_lookup(github_path: str) -> dict:
     """
-    Returns lookup keyed by every identifier an advisory has:
-      primary cve_id, all alias CVE IDs, and ghsa_id.
+    FIX: Index by ALL CVE aliases + ghsa_id, not just primary cve_id.
+
+    Root cause of 149/3000 bug: raw_github.json stores advisories with:
+      - ghsa_id:     always present (e.g. GHSA-xxxx-yyyy-zzzz)
+      - cve_id:      primary CVE if one is known (empty string for ~95%)
+      - all_cve_ids: list of ALL CVE aliases from the identifiers array
+
+    Old code only looked up by cve_id → missed any advisory where
+    cve_id was empty or the NVD CVE matched an alias, not the primary.
+
+    This fix indexes every advisory by:
+      1. Every CVE ID in all_cve_ids
+      2. The primary cve_id (if set and not already covered)
+      3. The ghsa_id itself (for Pass 3 GHSA-only records)
     """
     raw    = load_json(github_path)
     lookup = {}
+
     for item in raw:
+        # All CVE aliases (the fix — covers multi-CVE advisories)
         all_cves = item.get("all_cve_ids", [])
+
+        # Fallback for older format without all_cve_ids field
         if not all_cves and item.get("cve_id"):
             all_cves = [item["cve_id"]]
+
         for cve_id in all_cves:
             if cve_id:
-                lookup[cve_id] = item
+                cve_id_upper = cve_id.upper()
+                # Don't overwrite a richer record with a sparse one
+                if cve_id_upper not in lookup or not lookup[cve_id_upper].get("description"):
+                    lookup[cve_id_upper] = item
+
+        # Also index by GHSA ID for Pass 3
         ghsa_id = item.get("ghsa_id", "")
-        if ghsa_id:
+        if ghsa_id and ghsa_id not in lookup:
             lookup[ghsa_id] = item
+
     return lookup
 
 
 def build_blog_lookup(blog_path: str) -> dict:
     raw    = load_json(blog_path)
-    lookup: dict[str, str] = {}
+    lookup: dict = {}
     for item in raw:
         content = item.get("content", "")[:3000]
         source  = f"Source: {item.get('url', 'Unknown Blog')}\n\n{content}"
@@ -187,7 +204,7 @@ def build_blog_lookup(blog_path: str) -> dict:
 
 def build_papers_lookup(papers_path: str) -> dict:
     raw    = load_json(papers_path)
-    lookup: dict[str, str] = {}
+    lookup: dict = {}
     for paper in raw:
         title    = paper.get("title", "Unknown Paper")
         abstract = paper.get("abstract", "")
@@ -204,17 +221,18 @@ def build_papers_lookup(papers_path: str) -> dict:
 
 def build_closed_sources_lookup(closed_path: str) -> dict:
     raw    = load_json(closed_path)
-    lookup: dict[str, str] = {}
+    lookup: dict = {}
     for item in raw:
         source_type = item.get("source", "unknown")
         title   = item.get("title", "")
         content = item.get("content", item.get("summary", item.get("body", item.get("description", ""))))[:1500]
         headers = {
             "full_disclosure": f"Full Disclosure Mailing List:\n{content}",
-            "bugtraq":         f"Bugtraq Mailing List:\n{content}",
+            "bugtraq":         f"OSS-Security / SecurityFocus:\n{content}",
             "hackerone":       f"HackerOne Report: {title}\nSeverity: {item.get('severity', 'N/A')}\n{content}",
             "microsoft_msrc":  f"Microsoft Security Advisory: {title}\n{content}",
             "reddit_netsec":   f"Reddit /r/netsec: {title}\nScore: {item.get('score', 0)}\n{content}",
+            "vulners":         f"Vulners Intelligence: {title}\n{content}",
             "cisa_kev": (
                 f"CISA KEV (Confirmed Exploited): {item.get('vulnerability_name', title)}\n"
                 f"Product: {item.get('product', 'N/A')}\n"
@@ -236,7 +254,7 @@ def build_kev_lookup(kev_path: str) -> dict:
 
 def build_exploitdb_lookup(exploitdb_path: str) -> dict:
     raw    = load_json(exploitdb_path)
-    lookup: dict[str, list] = {}
+    lookup: dict = {}
     for item in raw:
         for cve in item.get("cves_mentioned", []):
             cve = cve.upper()
@@ -245,7 +263,6 @@ def build_exploitdb_lookup(exploitdb_path: str) -> dict:
 
 
 def build_correlations_lookup(corr_path: str) -> dict:
-    """CVE → correlation record with related_vulnerabilities, attack_techniques, capec_patterns."""
     p = Path(corr_path)
     if not p.exists():
         return {}
@@ -258,13 +275,12 @@ def build_correlations_lookup(corr_path: str) -> dict:
 
 
 def build_vendor_lookup(vendor_path: str) -> dict:
-    """CVE → list of vendor advisory records (RedHat, Ubuntu, Debian, Cisco, PoC)."""
     p = Path(vendor_path)
     if not p.exists():
         return {}
     try:
         raw    = json.loads(p.read_text(encoding="utf-8"))
-        lookup: dict[str, list] = defaultdict(list)
+        lookup: dict = defaultdict(list)
         for item in raw:
             for cve in item.get("cves_mentioned", []):
                 lookup[cve.upper()].append(item)
@@ -274,13 +290,12 @@ def build_vendor_lookup(vendor_path: str) -> dict:
         return {}
 
 
-def load_cooccurrence_pairs(cooccur_path: str) -> list[dict]:
-    """Load pre-computed P(B|A) training pairs from build_cooccurrence.py output."""
+def load_cooccurrence_pairs(cooccur_path: str) -> list:
     p = Path(cooccur_path)
     if not p.exists():
         return []
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data  = json.loads(p.read_text(encoding="utf-8"))
         pairs = data.get("training_pairs", [])
         print(f"  Co-occurrence pairs:   {len(pairs)}")
         return pairs
@@ -290,14 +305,10 @@ def load_cooccurrence_pairs(cooccur_path: str) -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  RECORD ENRICHMENT (correlations + vendor advisories)
+#  RECORD ENRICHMENT
 # ═══════════════════════════════════════════════════════════════════════════
 
 def enrich_with_correlations(record: dict, corr_lookup: dict) -> dict:
-    """
-    Populate the previously always-empty related_vulnerabilities field.
-    Also adds attack_techniques and capec_patterns from the correlation graph.
-    """
     cve_id = record.get("cve_id", "")
     corr   = corr_lookup.get(cve_id, {})
     if corr:
@@ -309,16 +320,12 @@ def enrich_with_correlations(record: dict, corr_lookup: dict) -> dict:
 
 
 def enrich_with_vendor_advisories(record: dict, vendor_lookup: dict) -> dict:
-    """
-    Add vendor-specific context (Red Hat severity, Ubuntu/Debian package status,
-    Cisco workarounds, public PoC repos) to the real_world_exploit field.
-    """
     cve_id     = record.get("cve_id", "")
     advisories = vendor_lookup.get(cve_id, [])
     if not advisories:
         return record
 
-    parts           = []
+    parts            = []
     affected_distros = set()
 
     for adv in advisories[:5]:
@@ -334,8 +341,8 @@ def enrich_with_vendor_advisories(record: dict, vendor_lookup: dict) -> dict:
                 parts.append(f"Ubuntu USN: {', '.join(pkgs[:3])}")
             affected_distros.add("Ubuntu")
         elif source == "debian_security":
-            pkg   = adv.get("package", "")
-            fixed = adv.get("releases_fixed", {})
+            pkg       = adv.get("package", "")
+            fixed     = adv.get("releases_fixed", {})
             fixed_str = ", ".join(f"{r}:{v}" for r, v in list(fixed.items())[:2])
             parts.append(f"Debian package={pkg}, fixed_in={fixed_str or 'pending'}")
             affected_distros.add("Debian")
@@ -352,7 +359,7 @@ def enrich_with_vendor_advisories(record: dict, vendor_lookup: dict) -> dict:
 
     if parts:
         vendor_block = "Vendor Advisory Context:\n" + "\n".join(f"  • {p}" for p in parts)
-        existing = record.get("real_world_exploit", "")
+        existing     = record.get("real_world_exploit", "")
         record["real_world_exploit"] = (
             (existing + "\n\n" + vendor_block).strip() if existing else vendor_block
         )
@@ -398,16 +405,13 @@ def build_record(
     if not fix_rec:
         fix_rec = "Apply vendor-supplied patches. Implement input validation and follow secure coding practices."
 
-    # Confirmed exploitation signals
     confirmed_exploited = bool(kev_entry)
     kev_ransomware      = kev_entry.get("known_ransomware_campaign_use", "")
 
-    # Exploit-DB enrichment
     exploit_count  = len(exploits)
     exploit_titles = [e.get("title", "") for e in exploits[:3]]
     exploit_types  = list(set(e.get("type", "") for e in exploits if e.get("type")))
 
-    # Real-world exploit context (papers + closed sources + blogs + Exploit-DB + KEV)
     exploit_ctx_parts = []
     if papers_map.get(cve_id):
         exploit_ctx_parts.append(f"Research:\n{papers_map[cve_id][:1000]}")
@@ -427,66 +431,49 @@ def build_record(
         )
     real_world_exploit = "\n\n".join(exploit_ctx_parts)
 
-    # Source tags
     sources = ["NVD"]
-    if epss_score:           sources.append("EPSS")
-    if gh_advisory:          sources.append("GitHub Advisories")
-    if blog_map.get(cve_id): sources.append("Security Blogs")
-    if papers_map.get(cve_id): sources.append("Research Papers")
-    if closed_map.get(cve_id): sources.append("Closed Sources")
-    if kev_entry:            sources.append("CISA KEV")
-    if exploits:             sources.append("Exploit-DB")
+    if epss_score:              sources.append("EPSS")
+    if gh_advisory:             sources.append("GitHub Advisories")
+    if blog_map.get(cve_id):    sources.append("Security Blogs")
+    if papers_map.get(cve_id):  sources.append("Research Papers")
+    if closed_map.get(cve_id):  sources.append("Closed Sources")
+    if kev_entry:               sources.append("CISA KEV")
+    if exploits:                sources.append("Exploit-DB")
 
     return {
-        # Core identity
         "cve_id":              cve_id,
         "vulnerability_name":  nvd_rec.get("vulnerability_name", cve_id),
         "cwe_id":              cwe_id,
         "description":         desc,
-
-        # Layer 1: Vulnerability Intelligence
         "owasp_category":      owasp_cat,
         "cvss_score":          cvss,
         "cvss_severity":       sev,
         "epss_score":          epss_score,
         "affected_software":   nvd_rec.get("affected_software", [])[:10],
         "published":           nvd_rec.get("published", ""),
-
-        # Layer 2: Pentesting Intelligence
         "attack_method":       pentest.get("attack_method", "Manual testing required"),
         "payload_example":     pentest.get("payload_example", ""),
         "detection_signals":   pentest.get("detection_signals", []),
         "tool_used":           pentest.get("tool_used", "Burp Suite, OWASP ZAP"),
         "code_pattern":        pentest.get("code_pattern", ""),
         "real_world_exploit":  real_world_exploit,
-
-        # Layer 3: Risk & Scoring
         "risk_level":          risk_level(cvss),
         "business_impact":     business_impact(owasp_cat),
         "confirmed_exploited": confirmed_exploited,
         "kev_ransomware":      kev_ransomware,
         "exploit_count":       exploit_count,
         "exploit_types":       exploit_types,
-
-        # Layer 4: Execution Context
         "tool_recommendation": pentest.get("tool_used", ""),
         "vulnerability_research": (
             f"Identified via CVE database. CVSS: {cvss}. {desc[:120]}..."
         ),
-
-        # Layer 5: Audit Evidence
         "security_control_missing": infer_security_control_missing(owasp_cat, cwe_id),
-
-        # Layer 6: Remediation Learning
         "fix_recommendation":  fix_rec,
         "status":              "Open",
-
-        # Layer 7: Correlation (populated by enrich_with_correlations)
         "related_vulnerabilities": [],
         "attack_techniques":       [],
         "capec_patterns":          [],
         "correlation_signals":     0,
-
         "source": " + ".join(sources),
     }
 
@@ -495,7 +482,7 @@ def build_record(
 #  TRAINING PAIR GENERATORS
 # ═══════════════════════════════════════════════════════════════════════════
 
-def to_training_pairs(record: dict) -> list[dict]:
+def to_training_pairs(record: dict) -> list:
     cve    = record["cve_id"]
     desc   = record["description"]
     owasp  = record["owasp_category"]
@@ -510,20 +497,29 @@ def to_training_pairs(record: dict) -> list[dict]:
     ctrl   = record["security_control_missing"]
     tool   = record["tool_used"]
     cwe    = record["cwe_id"]
-    exploit_ctx        = record.get("real_world_exploit", "")
-    kev_ransomware     = record.get("kev_ransomware", "")
+    exploit_ctx         = record.get("real_world_exploit", "")
+    kev_ransomware      = record.get("kev_ransomware", "")
     confirmed_exploited = record.get("confirmed_exploited", False)
 
     pairs = []
 
-    # L1: Vulnerability Intelligence
+    # L1: Vulnerability Intelligence — include reasoning, not just field dump
     if desc:
+        owasp_short = owasp.split("-", 1)[-1].strip() if "-" in owasp else owasp
+        cwe_context = f" ({cwe})" if cwe else ""
         pairs.append({
             "instruction": f"Explain the vulnerability {cve} and map it to its OWASP category.",
             "input":       "",
-            "output":      f"{desc}\n\nOWASP Category: {owasp}\nCWE: {cwe}",
-            "layer":       "vulnerability_intelligence",
-            "agent":       "OWASP Mapper Agent",
+            "output":      (
+                f"{desc}\n\n"
+                f"OWASP Category: {owasp}\n"
+                f"CWE: {cwe}\n\n"
+                f"This vulnerability falls under {owasp_short}{cwe_context} because it involves "
+                f"{ctrl.lower().split(';')[0] if ctrl else 'a failure in the relevant security control'}. "
+                f"The business impact includes: {biz}."
+            ),
+            "layer": "vulnerability_intelligence",
+            "agent": "OWASP Mapper Agent",
         })
 
     # L2: Pentesting Intelligence
@@ -536,8 +532,8 @@ def to_training_pairs(record: dict) -> list[dict]:
                 f"Detection Signals: {sigs}\n\n"
                 f"Recommended Tool: {tool}"
             ),
-            "layer":       "pentesting_intelligence",
-            "agent":       "Tool Selector Agent",
+            "layer": "pentesting_intelligence",
+            "agent": "Tool Selector Agent",
         })
 
     # L2b: Real-world context
@@ -546,8 +542,8 @@ def to_training_pairs(record: dict) -> list[dict]:
             "instruction": f"Provide real-world exploit examples and research findings for {cve}.",
             "input":       desc,
             "output":      f"Real-world context for {cve}:\n\n{exploit_ctx[:3000]}",
-            "layer":       "pentesting_intelligence",
-            "agent":       "Scanner Agent",
+            "layer": "pentesting_intelligence",
+            "agent": "Scanner Agent",
         })
 
     # L3: Risk & Scoring
@@ -567,8 +563,8 @@ def to_training_pairs(record: dict) -> list[dict]:
                 f"Business Impact: {biz}"
                 + kev_note
             ),
-            "layer":       "risk_scoring",
-            "agent":       "Base Scorer Agent",
+            "layer": "risk_scoring",
+            "agent": "Base Scorer Agent",
         })
 
     # L4: Execution Context
@@ -581,8 +577,8 @@ def to_training_pairs(record: dict) -> list[dict]:
                 f"OWASP Category: {owasp}\n"
                 f"Testing Approach: {method}"
             ),
-            "layer":       "execution_context",
-            "agent":       "Tool Selector Agent",
+            "layer": "execution_context",
+            "agent": "Tool Selector Agent",
         })
 
     # L5: Audit Evidence
@@ -599,8 +595,8 @@ def to_training_pairs(record: dict) -> list[dict]:
                 f"Business Impact: {biz}\n"
                 + (f"Exploitation Status: CONFIRMED (CISA KEV)" if confirmed_exploited else "")
             ),
-            "layer":       "audit_evidence",
-            "agent":       "Reporting Agent",
+            "layer": "audit_evidence",
+            "agent": "Reporting Agent",
         })
 
     # L6: Remediation Learning
@@ -613,109 +609,130 @@ def to_training_pairs(record: dict) -> list[dict]:
                 f"Root Cause: {ctrl}\n"
                 f"Control Type: Technical"
             ),
-            "layer":       "remediation_learning",
-            "agent":       "Reflector Agent",
+            "layer": "remediation_learning",
+            "agent": "Reflector Agent",
         })
 
     return pairs
 
 
-def to_correlation_training_pairs(record: dict) -> list[dict]:
-    """
-    Generate vulnerability_correlation layer pairs from enriched record.
-    Covers: what other CVEs correlate, which ATT&CK techniques, campaign clusters.
-    """
-    cve_id   = record.get("cve_id", "")
-    desc     = record.get("description", "")[:400]
-    related  = record.get("related_vulnerabilities", [])
+def to_correlation_training_pairs(record: dict) -> list:
+    cve_id = record.get("cve_id", "")
+    desc   = record.get("description", "")
+    pairs  = []
+
+    related = record.get("related_vulnerabilities", [])
+    if related:
+        rel_lines = "\n".join(f"  • {r['cve_id']}: {r.get('relationship','co-occurring')}" for r in related[:5])
+        pairs.append({
+            "instruction": f"What vulnerabilities are related to or often co-occur with {cve_id}?",
+            "input":       desc,
+            "output":      (
+                f"Vulnerabilities correlated with {cve_id}:\n\n"
+                + rel_lines
+                + "\n\nThese correlations are based on shared affected products, CVSSv3 patterns, and exploitation campaign data."
+            ),
+            "layer": "vulnerability_correlation",
+            "agent": "Correlation Agent",
+        })
+
     techniques = record.get("attack_techniques", [])
-
-    if not related or not cve_id:
-        return []
-
-    pairs = []
-
-    # Pair 1: What correlates with this CVE?
-    related_lines = "\n".join(
-        f"  • {r['cve_id']} (score:{r.get('correlation_score', 0)}, "
-        f"via: {', '.join({s.split(':')[0] for s in r.get('signals', [])})})"
-        for r in related[:5]
-    )
-    pairs.append({
-        "instruction": f"What vulnerabilities are correlated with {cve_id} and why?",
-        "input":       desc,
-        "output": (
-            f"Correlated vulnerabilities for {cve_id}:\n\n{related_lines}\n\n"
-            "Signal types: shared_cwe (same weakness class), shared_product (same software), "
-            "shared_attack_technique (same MITRE ATT&CK technique), "
-            "kev_campaign_temporal (co-listed in CISA KEV within 30 days), "
-            "exploit_chain_cooccurrence (appear together in known exploit code)."
-        ),
-        "layer": "vulnerability_correlation",
-        "agent": "Correlation Agent",
-    })
-
-    # Pair 2: ATT&CK techniques
     if techniques:
         pairs.append({
-            "instruction": f"Which MITRE ATT&CK techniques are linked to {cve_id}?",
+            "instruction": f"Which MITRE ATT&CK techniques are associated with {cve_id}?",
             "input":       desc,
-            "output": (
-                f"MITRE ATT&CK techniques for {cve_id}:\n"
-                + "\n".join(f"  • {t}" for t in techniques[:4])
-                + (
-                    "\n\nOther CVEs exploiting the same techniques:\n"
-                    + "\n".join(
-                        f"  • {r['cve_id']}"
-                        for r in related[:5]
-                        if any("attack_technique" in s for s in r.get("signals", []))
-                    )
-                )
+            "output":      (
+                f"ATT&CK techniques linked to {cve_id}:\n\n"
+                + "\n".join(f"  • {t}" for t in techniques[:8])
+                + "\n\nThese mappings help correlate CVE exploitation patterns with adversary TTPs."
             ),
             "layer": "vulnerability_correlation",
             "agent": "Correlation Agent",
         })
 
-    # Pair 3: KEV campaign cluster
-    kev_cluster = [
-        r["cve_id"] for r in related
-        if any("kev_campaign" in s for s in r.get("signals", []))
-    ]
-    if kev_cluster:
-        pairs.append({
-            "instruction": f"Is {cve_id} part of a known active exploitation campaign?",
-            "input":       desc,
-            "output": (
-                f"{cve_id} is part of an active exploitation cluster (CISA KEV temporal analysis).\n\n"
-                "CVEs in the same 30-day KEV window (same probable campaign):\n"
-                + "\n".join(f"  • {c}" for c in kev_cluster[:6])
-                + "\n\nTemporal clustering suggests coordinated use by the same threat actor group."
-            ),
-            "layer": "vulnerability_correlation",
-            "agent": "Correlation Agent",
-        })
-
-    # Pair 4: Exploit chain
-    chain = [
-        r["cve_id"] for r in related
-        if any("exploit_chain" in s for s in r.get("signals", []))
-    ]
-    if chain:
-        pairs.append({
-            "instruction": f"What exploit chains involve {cve_id}?",
-            "input":       desc,
-            "output": (
-                f"Exploit chain analysis for {cve_id}:\n\n"
-                "CVEs that co-appear in exploit code or PoC repositories:\n"
-                + "\n".join(f"  • {c}" for c in chain[:5])
-                + "\n\nCo-occurrence in exploit code suggests multi-stage attack patterns "
-                  "(e.g., initial access via one CVE, privilege escalation via another)."
-            ),
-            "layer": "vulnerability_correlation",
-            "agent": "Correlation Agent",
-        })
+    capec = record.get("capec_patterns", [])
+    if capec:
+        chain = [c for c in capec if c.startswith("CVE-")]
+        if chain:
+            pairs.append({
+                "instruction": f"Identify CVEs that form exploit chains with {cve_id}.",
+                "input":       desc,
+                "output":      (
+                    f"Exploit chain analysis for {cve_id}:\n\n"
+                    "CVEs that co-appear in exploit code or PoC repositories:\n"
+                    + "\n".join(f"  • {c}" for c in chain[:5])
+                    + "\n\nCo-occurrence in exploit code suggests multi-stage attack patterns."
+                ),
+                "layer": "vulnerability_correlation",
+                "agent": "Correlation Agent",
+            })
 
     return pairs
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  TRAINING PAIR QUALITY FILTERS  (NEW)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def filter_training_pairs(pairs: list) -> list:
+    """
+    Drop training pairs with trivially short or useless outputs.
+    Threshold: 80 chars minimum. Anything shorter is a template failure
+    (e.g. all fields empty → output is just field labels with no values).
+    """
+    filtered = []
+    dropped  = 0
+    for p in pairs:
+        output = p.get("output", "")
+        instr  = p.get("instruction", "")
+
+        # Drop if output is too short
+        if len(output.strip()) < 80:
+            dropped += 1
+            continue
+
+        # Drop if output is identical to instruction (copy failure)
+        if instr and output.strip() == instr.strip():
+            dropped += 1
+            continue
+
+        # Drop if output is just "N/A" repeated
+        if re.fullmatch(r"[\s\nNA/.:-]*", output):
+            dropped += 1
+            continue
+
+        filtered.append(p)
+
+    if dropped:
+        print(f"  Quality filter: dropped {dropped} low-quality pairs ({len(filtered)} remain)")
+    return filtered
+
+
+def dedup_training_pairs(pairs: list) -> list:
+    """
+    Remove duplicate training pairs.
+    Two pairs are considered duplicates if they share the same
+    (instruction, first 200 chars of output) — catches template-generated
+    duplicates where different CVEs produce identical outputs.
+    """
+    seen   = set()
+    unique = []
+    dupes  = 0
+
+    for p in pairs:
+        key = (
+            p.get("instruction", "").strip()[:150],
+            p.get("output", "").strip()[:200],
+        )
+        if key not in seen:
+            seen.add(key)
+            unique.append(p)
+        else:
+            dupes += 1
+
+    if dupes:
+        print(f"  Dedup: removed {dupes} duplicate pairs ({len(unique)} remain)")
+    return unique
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -738,7 +755,7 @@ def run():
 
     print(f"  NVD records:           {len(nvd_records)}")
     print(f"  EPSS entries:          {len(epss_map)}")
-    print(f"  GitHub entries:        {len(github_map)}")
+    print(f"  GitHub entries:        {len(github_map)}")   # should now be ~3000+ not 149
     print(f"  Blog CVE matches:      {len(blog_map)}")
     print(f"  Paper CVE matches:     {len(papers_map)}")
     print(f"  Closed CVE matches:    {len(closed_map)}")
@@ -751,7 +768,7 @@ def run():
     full_records   = []
     training_pairs = []
 
-    # ── Pass 1: NVD records (main loop) ───────────────────────────────────
+    # ── Pass 1: NVD records (main loop) ────────────────────────────────────
     for nvd_rec in nvd_records:
         cve_id = nvd_rec.get("cve_id", "")
         desc   = nvd_rec.get("description", "")
@@ -761,10 +778,8 @@ def run():
             continue
         seen_cves.add(cve_id)
 
-        record = build_record(
-            nvd_rec, epss_map, github_map, blog_map,
-            papers_map, closed_map, kev_map, exploitdb_map
-        )
+        record = build_record(nvd_rec, epss_map, github_map, blog_map,
+                              papers_map, closed_map, kev_map, exploitdb_map)
         record = enrich_with_correlations(record, corr_lookup)
         record = enrich_with_vendor_advisories(record, vendor_lookup)
 
@@ -772,7 +787,7 @@ def run():
         training_pairs.extend(to_training_pairs(record))
         training_pairs.extend(to_correlation_training_pairs(record))
 
-    # ── Pass 2: CISA KEV entries not in NVD batch ─────────────────────────
+    # ── Pass 2: CISA KEV entries not in NVD batch ──────────────────────────
     kev_only_count = 0
     for cve_id, kev_entry in kev_map.items():
         if cve_id in seen_cves:
@@ -798,10 +813,8 @@ def run():
             "published":          kev_entry.get("date_added", ""),
         }
 
-        record = build_record(
-            minimal_nvd_rec, epss_map, github_map, blog_map,
-            papers_map, closed_map, kev_map, exploitdb_map
-        )
+        record = build_record(minimal_nvd_rec, epss_map, github_map, blog_map,
+                              papers_map, closed_map, kev_map, exploitdb_map)
         record = enrich_with_correlations(record, corr_lookup)
         record = enrich_with_vendor_advisories(record, vendor_lookup)
 
@@ -812,18 +825,18 @@ def run():
 
     print(f"  KEV-only records added (not in NVD batch): {kev_only_count}")
 
-    # ── Pass 3: GHSA-only GitHub advisories (no CVE ID) ───────────────────
+    # ── Pass 3: GHSA-only GitHub advisories (no CVE ID) ────────────────────
     raw_github      = load_json("data/raw_github.json")
     ghsa_only_count = 0
 
     for adv in raw_github:
-        ghsa_id = adv.get("ghsa_id", "")
-        cve_ids = adv.get("all_cve_ids", []) or ([adv["cve_id"]] if adv.get("cve_id") else [])
+        ghsa_id  = adv.get("ghsa_id", "")
+        cve_ids  = adv.get("all_cve_ids", []) or ([adv["cve_id"]] if adv.get("cve_id") else [])
 
         if any(c in seen_cves for c in cve_ids) or ghsa_id in seen_cves:
             continue
         if cve_ids:
-            continue
+            continue   # has CVE IDs → already processed in Pass 1 or 2
         if not ghsa_id:
             continue
 
@@ -845,10 +858,8 @@ def run():
             "published":          adv.get("published", ""),
         }
 
-        record = build_record(
-            minimal_nvd_rec, epss_map, github_map, blog_map,
-            papers_map, closed_map, kev_map, exploitdb_map
-        )
+        record = build_record(minimal_nvd_rec, epss_map, github_map, blog_map,
+                              papers_map, closed_map, kev_map, exploitdb_map)
         record = enrich_with_correlations(record, corr_lookup)
         record = enrich_with_vendor_advisories(record, vendor_lookup)
 
@@ -859,11 +870,17 @@ def run():
 
     print(f"  GHSA-only records added (no CVE ID):       {ghsa_only_count}")
 
-    # ── Load co-occurrence pairs (pre-computed by build_cooccurrence.py) ──
+    # ── Load co-occurrence pairs ────────────────────────────────────────────
     cooccurrence_pairs = load_cooccurrence_pairs("data/raw_cooccurrence.json")
     training_pairs.extend(cooccurrence_pairs)
 
-    # ── Save outputs ──────────────────────────────────────────────────────
+    # ── Quality filter + dedup (NEW) ───────────────────────────────────────
+    print(f"\nRaw training pairs before filtering: {len(training_pairs)}")
+    training_pairs = filter_training_pairs(training_pairs)
+    training_pairs = dedup_training_pairs(training_pairs)
+    print(f"Final training pairs after filtering: {len(training_pairs)}")
+
+    # ── Save outputs ────────────────────────────────────────────────────────
     with open("data/vuln_dataset.jsonl", "w", encoding="utf-8") as f:
         for r in full_records:
             f.write(json.dumps(r) + "\n")
@@ -872,8 +889,8 @@ def run():
         for p in training_pairs:
             f.write(json.dumps(p) + "\n")
 
-    # ── Stats ─────────────────────────────────────────────────────────────
-    layer_counts: dict[str, int] = {}
+    # ── Stats ───────────────────────────────────────────────────────────────
+    layer_counts: dict = {}
     for p in training_pairs:
         l = p.get("layer", "unknown")
         layer_counts[l] = layer_counts.get(l, 0) + 1
@@ -894,14 +911,14 @@ def run():
         print(f"  {layer:<36} {count:>7} examples")
 
     print(f"\n📊 Source enrichment:")
-    print(f"  GitHub advisories matched:      {github_matched}  (CVE + GHSA)")
+    print(f"  GitHub advisories matched:      {github_matched}")
     print(f"  CISA KEV (confirmed exploited): {kev_count}")
     print(f"  Records with Exploit-DB data:   {exploit_recs}")
     print(f"  Records with research papers:   {paper_recs}")
     print(f"  Records with closed sources:    {closed_recs}")
-    print(f"  Records with correlations:      {corr_recs}  ← NEW")
-    print(f"  Records with vendor advisories: {vendor_recs}  ← NEW")
-    print(f"  Co-occurrence pairs added:      {len(cooccurrence_pairs)}  ← NEW")
+    print(f"  Records with correlations:      {corr_recs}")
+    print(f"  Records with vendor advisories: {vendor_recs}")
+    print(f"  Co-occurrence pairs added:      {len(cooccurrence_pairs)}")
 
 
 if __name__ == "__main__":

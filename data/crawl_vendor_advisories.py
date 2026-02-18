@@ -7,11 +7,14 @@ kind of "closed / semi-private" data Suresh sir is asking for.
 
 Sources:
   - Cisco PSIRT openVuln API (free, requires client_id + client_secret)
-  - Red Hat Security Data API (free, no auth)
-  - Ubuntu Security Notices (USN) - RSS/JSON (free, no auth)
+  - Red Hat Security Data API (free, no auth) — FIXED: updated to hydra endpoint
+  - Ubuntu Security Notices (USN) — FIXED: switched to RSS feed (JSON API broken)
   - Debian Security Tracker JSON (free, no auth)
-  - Microsoft Security Update Guide (MSRC) - optional API key
-  - VMware Security Advisories (VMSA) - free crawl
+  - PoC-in-GitHub exploit index
+
+FIXES in this version:
+  - Red Hat 404: labs/securitydataapi deprecated → hydra/rest/securitydata
+  - Ubuntu 422: JSON notices API dropped 'order' param → use RSS feed instead
 
 Output: data/raw_vendor_advisories.json
 """
@@ -28,12 +31,16 @@ from pathlib import Path
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 CISCO_TOKEN_URL    = "https://id.cisco.com/oauth2/default/v1/token"
 CISCO_ADVISORIES   = "https://apix.cisco.com/security/advisories/v2/all"
-REDHAT_API         = "https://access.redhat.com/labs/securitydataapi/cve.json"
-REDHAT_CVE_API     = "https://access.redhat.com/labs/securitydataapi/cve/{cve_id}.json"
-UBUNTU_USN_API     = "https://ubuntu.com/security/notices.json"
+
+# FIX: Updated from deprecated labs/securitydataapi → hydra/rest/securitydata
+REDHAT_API         = "https://access.redhat.com/hydra/rest/securitydata/cve.json"
+REDHAT_CVE_API     = "https://access.redhat.com/hydra/rest/securitydata/cve/{cve_id}.json"
+
+# FIX: Ubuntu JSON API broken → using RSS feed
+UBUNTU_USN_RSS     = "https://ubuntu.com/security/notices/rss.xml"
+
 DEBIAN_TRACKER     = "https://security-tracker.debian.org/tracker/data/json"
 DEBIAN_CVE_PREFIX  = "https://security-tracker.debian.org/tracker/{cve_id}"
-VMSA_FEED          = "https://www.vmware.com/security/advisories.html"
 
 
 # ── 1. Cisco PSIRT openVuln API ────────────────────────────────────────────────
@@ -63,7 +70,7 @@ def get_cisco_token() -> str:
         return ""
 
 
-def crawl_cisco_advisories(max_advisories: int = 200) -> list[dict]:
+def crawl_cisco_advisories(max_advisories: int = 200) -> list:
     """
     Fetch Cisco PSIRT advisories via openVuln API.
     Cisco advisories often pre-date NVD publication by weeks and contain
@@ -101,7 +108,6 @@ def crawl_cisco_advisories(max_advisories: int = 200) -> list[dict]:
     records = []
     for adv in data.get("advisories", []):
         cves = adv.get("cves", []) or []
-        # Also mine the advisory ID (SA-...) and description
         desc = adv.get("advisoryDescription", adv.get("summary", ""))
         extra_cves = re.findall(r"CVE-\d{4}-\d+", desc, re.IGNORECASE)
         all_cves = list(set([c.upper() for c in cves + extra_cves if c]))
@@ -113,7 +119,7 @@ def crawl_cisco_advisories(max_advisories: int = 200) -> list[dict]:
             "description":          desc[:2000],
             "cvss_score":           adv.get("cvssBaseScore", ""),
             "cvss_vector":          adv.get("cvssVector", ""),
-            "severity":             adv.get("sir", ""),         # Critical/High/Medium/Low
+            "severity":             adv.get("sir", ""),
             "first_published":      adv.get("firstPublished", ""),
             "last_updated":         adv.get("lastUpdated", ""),
             "products_affected":    adv.get("productNames", [])[:10],
@@ -130,12 +136,12 @@ def crawl_cisco_advisories(max_advisories: int = 200) -> list[dict]:
 
 # ── 2. Red Hat Security Data API ───────────────────────────────────────────────
 
-def crawl_redhat_advisories(days_back: int = 90, max_cves: int = 300) -> list[dict]:
+def crawl_redhat_advisories(days_back: int = 180, max_cves: int = 300) -> list:
     """
-    Fetch recent CVE advisories from Red Hat Security Data API.
+    Fetch recent CVE advisories from Red Hat Security Data API (hydra endpoint).
     Red Hat's data is authoritative for RHEL/CentOS/Fedora and includes
     errata IDs, affected RPMs, severity ratings, and CVSS vectors that
-    often differ from NVD (Red Hat uses its own CVSS assessment).
+    often differ from NVD.
 
     No authentication required.
     """
@@ -151,16 +157,21 @@ def crawl_redhat_advisories(days_back: int = 90, max_cves: int = 300) -> list[di
                 "per_page": min(max_cves, 1000),
                 "page":     1,
             },
+            headers={"User-Agent": "Mozilla/5.0 (security research)"},
             timeout=60,
         )
         resp.raise_for_status()
         cve_list = resp.json()
     except Exception as e:
         print(f"  ⚠️  Red Hat API failed: {e}")
-        return []
+        print("      Trying fallback per-CVE scrape...")
+        return _redhat_fallback_scrape()
+
+    if not isinstance(cve_list, list):
+        print(f"  ⚠️  Red Hat returned unexpected format: {type(cve_list)}")
+        return _redhat_fallback_scrape()
 
     records = []
-    # Fetch details for a subset (full detail has errata, affected packages)
     for i, cve_summary in enumerate(cve_list[:max_cves]):
         cve_id = cve_summary.get("CVE", "")
         if not cve_id:
@@ -169,14 +180,14 @@ def crawl_redhat_advisories(days_back: int = 90, max_cves: int = 300) -> list[di
         try:
             detail_resp = requests.get(
                 REDHAT_CVE_API.format(cve_id=cve_id),
+                headers={"User-Agent": "Mozilla/5.0"},
                 timeout=20,
             )
             detail_resp.raise_for_status()
             detail = detail_resp.json()
 
-            # Extract affected packages and errata
             affected_packages = []
-            errata_ids = []
+            errata_ids        = []
             for pkg in detail.get("affected_packages", []):
                 affected_packages.append(pkg.get("package_name", ""))
             for fix in detail.get("package_state", []):
@@ -185,7 +196,7 @@ def crawl_redhat_advisories(days_back: int = 90, max_cves: int = 300) -> list[di
             bugzilla = detail.get("bugzilla", {})
             desc = detail.get("details", [detail.get("bugzilla", {}).get("description", "")])
             if isinstance(desc, list):
-                desc = " ".join(desc)
+                desc = " ".join(str(d) for d in desc)
 
             records.append({
                 "source":              "redhat_security",
@@ -205,10 +216,9 @@ def crawl_redhat_advisories(days_back: int = 90, max_cves: int = 300) -> list[di
                 "url":                 f"https://access.redhat.com/security/cve/{cve_id}",
             })
 
-            time.sleep(0.3)  # Polite rate limiting
+            time.sleep(0.3)
 
-        except Exception as e:
-            # Silently skip individual CVE detail failures
+        except Exception:
             continue
 
         if (i + 1) % 50 == 0:
@@ -218,76 +228,121 @@ def crawl_redhat_advisories(days_back: int = 90, max_cves: int = 300) -> list[di
     return records
 
 
-# ── 3. Ubuntu Security Notices (USN) ──────────────────────────────────────────
+def _redhat_fallback_scrape() -> list:
+    """
+    Fallback: use Red Hat's public CVE listing page to get recent CVE IDs,
+    then fetch brief details via the individual CVE endpoint.
+    """
+    print("  Attempting Red Hat fallback scrape...")
+    records = []
 
-def crawl_ubuntu_usn(max_notices: int = 200) -> list[dict]:
+    # Try the old labs endpoint for listing (just the CVE IDs — may still work)
+    try:
+        resp = requests.get(
+            "https://access.redhat.com/labs/securitydataapi/cve.json",
+            params={"per_page": 100, "page": 1},
+            timeout=30,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if resp.status_code == 200:
+            cve_list = resp.json()
+            for item in cve_list[:50]:
+                cve_id = item.get("CVE", "")
+                if cve_id:
+                    records.append({
+                        "source":         "redhat_security",
+                        "cve_id":         cve_id,
+                        "title":          cve_id,
+                        "description":    f"Red Hat tracked vulnerability: {cve_id}",
+                        "severity":       item.get("severity", ""),
+                        "cvss_score":     str(item.get("cvss3_score", item.get("cvss_score", ""))),
+                        "cves_mentioned": [cve_id],
+                        "url":            f"https://access.redhat.com/security/cve/{cve_id}",
+                    })
+    except Exception as e:
+        print(f"  ⚠️  Red Hat fallback also failed: {e}")
+
+    print(f"  ✅ Red Hat (fallback): {len(records)} records")
+    return records
+
+
+# ── 3. Ubuntu Security Notices (USN) via RSS ──────────────────────────────────
+
+def crawl_ubuntu_usn(max_notices: int = 300) -> list:
     """
-    Fetch Ubuntu Security Notices from ubuntu.com/security/notices JSON API.
-    USNs contain Ubuntu-specific affected package versions, fixed versions,
-    and priority ratings different from NVD. No auth required.
+    FIX: Fetch Ubuntu Security Notices via RSS feed.
+    The JSON notices API (ubuntu.com/security/notices.json) dropped the 'order'
+    parameter and now returns 422. The RSS feed is stable and public.
     """
-    print(f"Fetching Ubuntu Security Notices (last {max_notices})...")
+    print(f"Fetching Ubuntu Security Notices via RSS...")
+
+    RSS_URL = "https://ubuntu.com/security/notices/rss.xml"
 
     try:
         resp = requests.get(
-            UBUNTU_USN_API,
-            params={"limit": max_notices, "offset": 0, "order": "newest"},
-            timeout=60,
+            RSS_URL,
+            timeout=30,
+            headers={"User-Agent": "Mozilla/5.0 (security research)"},
         )
         resp.raise_for_status()
-        data = resp.json()
+        root = ET.fromstring(resp.content)
     except Exception as e:
-        print(f"  ⚠️  Ubuntu USN fetch failed: {e}")
+        print(f"  ⚠️  Ubuntu RSS fetch failed: {e}")
         return []
 
-    records = []
-    for notice in data.get("notices", []):
-        cves = notice.get("cves", [])
-        if isinstance(cves, list):
-            cve_ids = [c if isinstance(c, str) else c.get("id", "") for c in cves]
-        else:
-            cve_ids = []
+    records  = []
+    channel  = root.find("channel")
+    if channel is None:
+        print("  ⚠️  Ubuntu RSS: no channel element found")
+        return []
 
-        # Also mine description
-        summary = notice.get("summary", "") + " " + notice.get("description", "")
-        extra_cves = re.findall(r"CVE-\d{4}-\d+", summary, re.IGNORECASE)
-        all_cves = list(set([c.upper() for c in cve_ids + extra_cves if c and c.startswith("CVE-")]))
+    for item in channel.findall("item"):
+        title       = (item.findtext("title") or "").strip()
+        description = (item.findtext("description") or "").strip()
+        link        = (item.findtext("link") or "").strip()
+        pub_date    = (item.findtext("pubDate") or "").strip()
 
-        if not all_cves:
+        # Strip HTML tags from description if any
+        description_clean = re.sub(r"<[^>]+>", " ", description).strip()
+
+        combined = title + " " + description_clean
+        cve_ids  = list(set(re.findall(r"CVE-\d{4}-\d+", combined, re.IGNORECASE)))
+        cve_ids  = [c.upper() for c in cve_ids]
+
+        if not cve_ids:
             continue
 
-        # Affected packages
-        packages = []
-        for release, pkgs in notice.get("releases", {}).items():
-            for pkg_name in pkgs.get("sources", {}).keys():
-                packages.append(f"{pkg_name} ({release})")
+        usn_match = re.search(r"USN-[\d-]+", title)
+        usn_id    = usn_match.group(0) if usn_match else ""
 
         records.append({
             "source":            "ubuntu_usn",
-            "usn_id":            notice.get("id", ""),
-            "title":             notice.get("title", ""),
-            "description":       notice.get("summary", "")[:1500],
-            "priority":          notice.get("isummary", ""),
-            "published":         notice.get("timestamp", ""),
-            "affected_packages": packages[:15],
-            "references":        notice.get("references", [])[:5],
-            "cves_mentioned":    all_cves,
-            "url":               f"https://ubuntu.com/security/notices/{notice.get('id', '')}",
+            "usn_id":            usn_id,
+            "title":             title[:200],
+            "description":       description_clean[:1500],
+            "priority":          "",
+            "published":         pub_date,
+            "affected_packages": [],
+            "references":        [link],
+            "cves_mentioned":    cve_ids,
+            "url":               link,
         })
 
-    print(f"  ✅ Ubuntu USN: {len(records)} notices with CVEs")
+        if len(records) >= max_notices:
+            break
+
+    print(f"  ✅ Ubuntu USN (RSS): {len(records)} notices with CVEs")
     return records
 
 
 # ── 4. Debian Security Tracker ────────────────────────────────────────────────
 
-def crawl_debian_security(max_cves: int = 500) -> list[dict]:
+def crawl_debian_security(max_cves: int = 500) -> list:
     """
     Fetch Debian security tracker data.
     Debian's tracker shows per-package, per-release vulnerability status
     (vulnerable / fixed / no-dsa / ignored) for every CVE tracked.
-    This is NOT available in NVD and provides unique correlation signals
-    between CVEs affecting the same Debian source package.
+    This is NOT available in NVD and provides unique correlation signals.
     No auth required.
     """
     print("Fetching Debian Security Tracker...")
@@ -301,9 +356,8 @@ def crawl_debian_security(max_cves: int = 500) -> list[dict]:
         return []
 
     records = []
-    count = 0
+    count   = 0
 
-    # Structure: {package_name: {cve_id: {releases: {...}, description: ...}}}
     for pkg_name, cve_dict in data.items():
         if not isinstance(cve_dict, dict):
             continue
@@ -313,18 +367,16 @@ def crawl_debian_security(max_cves: int = 500) -> list[dict]:
                 continue
             if count >= max_cves:
                 break
-
             if not isinstance(cve_info, dict):
                 continue
 
-            # Collect release-specific status
             releases_affected = {}
             releases_fixed    = {}
             for release_name, release_data in cve_info.get("releases", {}).items():
                 if not isinstance(release_data, dict):
                     continue
-                status = release_data.get("status", "")
-                urgency = release_data.get("urgency", "")
+                status    = release_data.get("status", "")
+                urgency   = release_data.get("urgency", "")
                 fixed_ver = release_data.get("fixed_version", "")
 
                 if status == "resolved":
@@ -354,44 +406,29 @@ def crawl_debian_security(max_cves: int = 500) -> list[dict]:
     return records
 
 
-# ── 5. Exploit-DB via PoC-in-GitHub ───────────────────────────────────────────
+# ── 5. PoC-in-GitHub exploit index ────────────────────────────────────────────
 
-def crawl_poc_in_github(max_cves: int = 200) -> list[dict]:
+def crawl_poc_in_github(max_cves: int = 200) -> list:
     """
-    Query the trickest/poc-in-github repository which catalogs public PoC
-    exploits on GitHub per CVE. This gives real-world weaponization signals
-    that are not in NVD or EPSS.
-
-    Uses the raw GitHub API for the index file — no auth required (rate limited).
-    With GITHUB_TOKEN: much higher limits.
+    Query GitHub API for public PoC exploit repositories.
+    Uses the GitHub search API — no auth required (rate limited).
+    With GITHUB_TOKEN env var: much higher rate limits.
     """
     print("Fetching PoC-in-GitHub exploit index...")
 
-    # This repo maintains a JSON index of CVEs with public PoCs
-    INDEX_URL = (
-        "https://raw.githubusercontent.com/trickest/cve/main/README.md"
-    )
-    # Better: use the actual structured data
-    STRUCTURED_URL = (
-        "https://raw.githubusercontent.com/nomi-sec/PoC-in-GitHub/master/README.md"
-    )
-
     github_token = os.getenv("GITHUB_TOKEN", "")
-    headers = {}
+    headers      = {"Accept": "application/vnd.github+json"}
     if github_token:
         headers["Authorization"] = f"token {github_token}"
 
-    # Use GitHub API to search for CVE PoC repositories
     api_url = "https://api.github.com/search/repositories"
-
-    records = []
-    # Search for recently updated CVE PoC repos
     queries = [
         "CVE PoC exploit in:name pushed:>2024-01-01",
         "CVE-2024 exploit proof-of-concept in:readme",
         "CVE-2023 RCE exploit in:name",
     ]
 
+    records = []
     for query in queries:
         try:
             resp = requests.get(
@@ -418,7 +455,6 @@ def crawl_poc_in_github(max_cves: int = 200) -> list[dict]:
 
                 cves = list(set(re.findall(r"CVE-\d{4}-\d+", readme_text, re.IGNORECASE)))
                 cves = [c.upper() for c in cves]
-
                 if not cves:
                     continue
 
@@ -435,13 +471,13 @@ def crawl_poc_in_github(max_cves: int = 200) -> list[dict]:
                     "url":            repo.get("html_url", ""),
                 })
 
-            time.sleep(2)  # GitHub search has strict rate limits
+            time.sleep(2)
 
         except Exception as e:
             print(f"  ⚠️  PoC GitHub search failed ({query[:40]}): {e}")
 
     # Deduplicate by repo
-    seen_repos = set()
+    seen_repos    = set()
     unique_records = []
     for r in records:
         if r["repo"] not in seen_repos:
@@ -455,7 +491,7 @@ def crawl_poc_in_github(max_cves: int = 200) -> list[dict]:
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def run(out: str = "data/raw_vendor_advisories.json"):
-    all_records: list[dict] = []
+    all_records: list = []
 
     print("\n🏢 Crawling vendor security advisory sources...\n")
 
@@ -464,12 +500,12 @@ def run(out: str = "data/raw_vendor_advisories.json"):
     all_records.extend(cisco_records)
     time.sleep(2)
 
-    # 2. Red Hat Security Data API (free, no auth)
+    # 2. Red Hat Security Data API (hydra endpoint, free, no auth)
     rh_records = crawl_redhat_advisories(days_back=180, max_cves=300)
     all_records.extend(rh_records)
     time.sleep(2)
 
-    # 3. Ubuntu USN (free, no auth)
+    # 3. Ubuntu USN via RSS (fixed — JSON API was returning 422)
     ubuntu_records = crawl_ubuntu_usn(max_notices=300)
     all_records.extend(ubuntu_records)
     time.sleep(2)
@@ -486,8 +522,7 @@ def run(out: str = "data/raw_vendor_advisories.json"):
     # Keep only records with CVE mentions
     records_with_cves = [r for r in all_records if r.get("cves_mentioned")]
 
-    # Source breakdown
-    source_counts: dict[str, int] = {}
+    source_counts: dict = {}
     for r in records_with_cves:
         src = r.get("source", "unknown")
         source_counts[src] = source_counts.get(src, 0) + 1
@@ -506,7 +541,6 @@ def run(out: str = "data/raw_vendor_advisories.json"):
 
 
 if __name__ == "__main__":
-    # Load .env if present
     env_file = Path(".env")
     if env_file.exists():
         for line in env_file.read_text().splitlines():
