@@ -168,7 +168,7 @@ def main():
     if args.correlate:
         from data.build_correlations import run as run_correlations
         step("Vulnerability Correlation Graph", run_correlations)
-        from data.build_cooccurrence import run as run_cooccurrence
+        from build_cooccurrence_v2 import run as run_cooccurrence
         step("Vulnerability Co-occurrence Model", run_cooccurrence)
         from data.build_dataset import run as run_build
         step("Build Dataset (merge + training pairs)", run_build)
@@ -215,7 +215,7 @@ def main():
         from data.build_correlations import run as run_correlations
         step("Vulnerability Correlation Graph", run_correlations)
 
-        from data.build_cooccurrence import run as run_cooccurrence
+        from build_cooccurrence_v2 import run as run_cooccurrence
         step("Vulnerability Co-occurrence Model (P(B|A), P(B|not A))", run_cooccurrence)
 
     from data.build_dataset import run as run_build
