@@ -45,7 +45,7 @@ from trl import SFTTrainer, SFTConfig
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 BASE_MODEL   = "mistralai/Mistral-7B-Instruct-v0.3"
-DATASET_PATH = Path("data") / "training_pairs.jsonl"
+DATASET_PATH = Path("data") / "all_training_pairs.jsonl"
 OUTPUT_DIR   = Path("./checkpoints/vuln-mistral-7b")
 HF_REPO_NAME = "adityajayashankar/vuln-mistral-7b"
 
