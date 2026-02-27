@@ -7,7 +7,7 @@ Pulls together FOUR data sources:
   1. CWE chains         (data/raw_cwe_chains.json)       — semantic relationships
   2. KEV clusters       (data/raw_kev_clusters.json)      — campaign co-occurrence
   3. Stack profiles     (stack_profiles.py)               — expert knowledge
-  4. NVD product data   (data/vuln_dataset.jsonl)         — product co-occurrence
+  4. NVD product data   (data/raw_nvd.json)               — product co-occurrence
 
 Produces:
   data/raw_cooccurrence_v2.json   — rich model for pair generation
@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
 
 DATA_DIR       = Path("data")
-NVD_FILE       = DATA_DIR / "vuln_dataset.jsonl"
+NVD_FILE       = DATA_DIR / "raw_nvd.json"
 CWE_CHAIN_FILE = DATA_DIR / "raw_cwe_chains.json"
 KEV_CLUSTER_FILE = DATA_DIR / "raw_kev_clusters.json"
 OUT_V2         = DATA_DIR / "raw_cooccurrence_v2.json"
@@ -347,7 +347,10 @@ def build_negative_registry():
 
 def main():
     log.info("Loading data sources …")
-    nvd_records = load_jsonl(NVD_FILE)
+    # Use raw_nvd.json so co-occurrence can run before build_dataset.py on fresh pipelines.
+    nvd_records = load_json(NVD_FILE)
+    if not isinstance(nvd_records, list):
+        nvd_records = []
     log.info(f"  NVD records: {len(nvd_records):,}")
 
     cwe_data = load_json(CWE_CHAIN_FILE)
