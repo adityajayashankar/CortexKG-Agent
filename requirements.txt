@@ -30,8 +30,13 @@ praw                     # Reddit API wrapper
 
 # ── Agentic pipeline (LangGraph) ─────────────────────────────────────────
 langgraph
+langchain
 langchain-core
-qdrant-client[fastembed]
+langchain-community
+langchain-huggingface
+qdrant-client
+pinecone; python_version < "3.13"  # optional SDK; HTTP fallback is used on 3.13+
+fastembed
 pydantic
 sentence-transformers
 
