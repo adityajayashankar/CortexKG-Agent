@@ -2,6 +2,39 @@
 
 This is the run order from scratch on Windows PowerShell, including required `$env:` variables.
 
+## Current Pending Gaps and Tasks (GPU-Laptop Embedding Plan)
+
+Decision: embedding/upsert is paused on this laptop and will be run on a separate GPU laptop.
+
+### Critical gaps still open
+
+1. Vector index is not fully populated yet.
+2. Hybrid retrieval is not fully validated at production scale (`GRAPHRAG_USE_VECTOR` should remain `0` until ingest completes).
+3. End-to-end acceptance run after full vector ingest is still pending.
+4. Secret hygiene follow-up is still pending (rotate exposed keys/tokens if not already rotated).
+
+### Pending tasks (in order)
+
+1. On GPU laptop: run full embedding + upsert to Qdrant cloud with:
+   - `scripts/maintenance/graphrag_embed_index_qdrant_cpu.py`
+   - target: `--max-vectors 225000` (or your final target)
+2. Verify Qdrant point count growth/completion on collection `vuln_kg_evidence_v1`.
+3. On this laptop: enable vector retrieval only after ingest completion:
+   - `$env:GRAPHRAG_USE_VECTOR="1"`
+   - `$env:AGENT_GRAPHRAG_USE_VECTOR="1"`
+4. Run agent regression queries:
+   - `CVE-2021-28310` plus 4 additional benchmark CVEs.
+5. Confirm report quality:
+   - non-empty graph evidence,
+   - non-zero vector contribution,
+   - stable confidence/citations.
+
+### Definition of done
+
+1. Qdrant collection has full target vectors (225k or chosen target).
+2. `main.py` returns hybrid evidence with vector hits enabled.
+3. No critical schema/integrity failures in KG validation checks.
+
 ## 1) Open project and activate venv
 
 ```powershell

@@ -1,5 +1,29 @@
 # DeplAI Project Status Report (2026-02-27)
 
+## Status Update (2026-02-28)
+
+This report is still valid for baseline metrics, but project status changed materially on 2026-02-28:
+
+1. Vector backend migration completed:
+   - Active runtime path is now Qdrant-first (indexer + retriever + upsert scripts).
+   - Direct-script import collision was fixed by renaming helper module to `pipeline/graphrag/qdrant_conn.py`.
+2. New production ingest path implemented:
+   - `scripts/maintenance/graphrag_embed_index_qdrant_cpu.py`
+   - Streams chunks, embeds locally on CPU (`BAAI/bge-small-en-v1.5`, dim=384), and upserts to Qdrant in one pass.
+   - No JSON intermediate cache required for the main path.
+3. Live smoke ingest succeeded:
+   - Command: `python scripts/maintenance/graphrag_embed_index_qdrant_cpu.py --max-vectors 2000 --batch-size 64 --qdrant-batch-size 256`
+   - Result: `processed=2000` in `00:02:08` at `15.60 embeddings/sec`.
+4. Qdrant cloud connectivity verified from CLI:
+   - `collections=[CollectionDescription(name='vuln_kg_evidence_v1')]`
+
+Current practical meaning:
+- Graph path is working and remains primary.
+- Vector pipeline is now operational and test-proven, but full 225k ingest completion is still pending.
+- Expected full ingest time at observed smoke throughput is ~4.0 hours (`225000 / 15.6`).
+
+---
+
 ## 1) Executive Summary
 
 The core pipeline is operational end-to-end:
@@ -10,12 +34,14 @@ The core pipeline is operational end-to-end:
 
 Primary compromises still affecting quality/performance:
 
-1. Vector index mismatch and incompleteness:
-   - Remote Qdrant collection is reachable but has **0 points**.
-   - Local Qdrant has **20,038 points** only (partial index), while latest full chunk build was **6,252,241** chunks.
-2. Full embedding/upsert runtime is currently too high for full refresh cadence.
-3. LLM backend reliability is degraded by model rate limits and decommissioned model IDs.
-4. Some source and training-layer imbalances remain (not blockers, but quality risks).
+1. Vector index completeness:
+   - Runtime and scripts are now aligned on Qdrant, but full target ingest is not complete yet.
+   - Successful smoke run exists (2,000 vectors); full 225k run is in progress/planned.
+2. CPU throughput is still lower than ideal target:
+   - Observed throughput: **15.60 embeddings/sec** on smoke test.
+   - This is stable, but below the original 25-45/sec ambition.
+3. LLM backend reliability is still sensitive to provider/model availability and rate limits.
+4. Some source/training-layer imbalances remain (e.g., thin `execution_context`, weak ExploitDB feed).
 
 ---
 
@@ -121,10 +147,12 @@ Relationships:
 Latest observed full chunk build log:
 - `Chunk build complete: raw=6,252,241 deduped=6,252,241`
 
-Qdrant status:
-- Remote collection `vuln_kg_evidence_v1`: **0 points**
-- Local collection `data/qdrant/vuln_kg_evidence_v1`: **20,038 points**
-  - This is **0.32%** of the last full chunk build volume.
+Qdrant status (updated 2026-02-28):
+- Cloud collection `vuln_kg_evidence_v1`: reachable and writable (verified).
+- Streaming embed+upsert smoke run:
+  - `max-vectors=2000`, `batch-size=64`, `qdrant-batch-size=256`
+  - Completed successfully at `15.60 embeddings/sec` in `128s`.
+- Full ingest strategy now targets **225,000** vectors first (not 6.25M one-shot).
 
 ### G. Agent Runtime Metrics (live run probe)
 
@@ -146,19 +174,18 @@ This confirms KG traversal is active in the agent path.
 
 ## 3) Where the Workflow Is Compromised
 
-## C1. Vector retrieval path is effectively disabled in practice
+## C1. Vector retrieval path is partially fixed, not yet fully activated
 
 What is happening:
-- Agent/retriever path is currently graph-first and usually graph-only (`use_vector=false` defaults).
-- Even if vector is enabled, configured remote Qdrant has 0 points.
+- Retriever/indexer now use Qdrant runtime path consistently.
+- Ingest pipeline is operational and tested (2k smoke), but production-scale vector population is incomplete.
+- Agent defaults still keep vector off during ingestion (`GRAPHRAG_USE_VECTOR=0`, `AGENT_GRAPHRAG_USE_VECTOR=0`).
 
 Impact:
-- No semantic/vector evidence contribution.
-- Hybrid retrieval confidence and diversity are underutilized.
+- Hybrid retrieval remains underutilized until full ingest is completed and vector is enabled.
 
 Root cause:
-- Indexing went into local Qdrant earlier, while runtime points to remote Qdrant URL.
-- Full remote backfill was not completed.
+- Previously split/partial index states; now corrected path, pending full backfill execution.
 
 ## C2. Embedding backlog is too large for one-shot indexing
 
@@ -207,42 +234,38 @@ Impact:
 
 ## 4) Fix Plan (Upcoming Days)
 
-## Day 0 (today): Stabilize runtime path
+## Day 0 (completed): Stabilize runtime path
 
 1. Pick one Qdrant target and stick to it:
-   - Option A: remote cloud (recommended for scale)
-   - Option B: local only (for dev)
+   - Chosen: remote cloud Qdrant endpoint.
 2. Set env consistently (`QDRANT_URL`, `QDRANT_COLLECTION`, `GRAPHRAG_USE_VECTOR`).
-3. Remove decommissioned models from `pipeline/model_loader.py`.
-4. Rotate exposed API keys and DB credentials.
+3. Implement single-pass streaming CPU embed+upsert pipeline.
+4. Rotate exposed API keys and DB credentials (still required if not already done).
 
-Targets by end of Day 0:
-- `main.py` query returns graph evidence consistently without `needs_human_review`.
-- No decommissioned-model errors in logs.
+Completed evidence:
+- Qdrant collection reachable from CLI.
+- 2k ingest smoke succeeded end-to-end.
 
-## Day 1: Fast usable vector baseline (not full backfill yet)
+## Day 1: Full 225k vector baseline
 
-1. Index in slices (not monolith):
-   - dataset slice
-   - co-occurrence slice
-   - top-ranked correlations slice
-2. Use caps per run:
-   - `GRAPHRAG_MAX_TOTAL_CHUNKS` set to a staged value (e.g., 200k then 500k).
-3. Turn on vector retrieval after first successful slice (`AGENT_GRAPHRAG_USE_VECTOR=1`).
+1. Run full ingest:
+   - `python scripts/maintenance/graphrag_embed_index_qdrant_cpu.py --max-vectors 225000 --batch-size 64 --qdrant-batch-size 256`
+2. Resume with `--resume-from` if interrupted.
+3. Enable vector retrieval only after ingest completion.
 
 Targets by end of Day 1:
-- Remote Qdrant points >= **500k**
-- `graphrag_query` rationale shows non-zero vector candidates.
+- Qdrant points >= **225k**
+- Agent query shows non-zero vector candidates when vector mode is enabled.
 
-## Day 2: Scale up backfill safely
+## Day 2: Throughput and quality tuning
 
-1. Continue chunk slices until >= 2M points.
-2. Prioritize high-signal relations first (top score correlations + KEV-driven co-occurrence).
-3. Validate latency and memory during indexing.
+1. Optimize CPU throughput (thread tuning, batch tuning, model warm cache).
+2. Decide whether to scale beyond 225k based on retrieval quality and cost.
+3. Validate latency, evidence diversity, and citation quality on a CVE benchmark set.
 
 Targets by end of Day 2:
-- Remote Qdrant points >= **2M**
-- Query latency acceptable for CLI usage.
+- Stable hybrid retrieval with acceptable response latency.
+- Clear go/no-go decision on further backfill volume.
 
 ## Day 3+: Fullness + quality hardening
 
@@ -298,4 +321,3 @@ from qdrant_client import QdrantClient
 c = QdrantClient(url="https://<your-qdrant>")
 print(c.get_collection("vuln_kg_evidence_v1"))
 ```
-
