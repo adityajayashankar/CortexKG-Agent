@@ -3,21 +3,57 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
-from pipeline.graphrag.schema import (
-    Citation,
-    ConfidenceSummary,
-    EvidenceItem,
-    GraphEntity,
-    GraphRAGAgentResponse,
-    dump_model,
-)
+try:
+    from pipeline.graphrag.embeddings import embed_query as shared_embed_query
+    from pipeline.graphrag.qdrant_conn import get_qdrant_client
+    from pipeline.graphrag.schema import (
+        Citation,
+        ConfidenceSummary,
+        EvidenceItem,
+        GraphEntity,
+        GraphRAGAgentResponse,
+        dump_model,
+    )
+except ModuleNotFoundError:
+    ROOT = Path(__file__).resolve().parents[2]
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from pipeline.graphrag.embeddings import embed_query as shared_embed_query
+    from pipeline.graphrag.qdrant_conn import get_qdrant_client
+    from pipeline.graphrag.schema import (
+        Citation,
+        ConfidenceSummary,
+        EvidenceItem,
+        GraphEntity,
+        GraphRAGAgentResponse,
+        dump_model,
+    )
 
 
 _CVE_RE = re.compile(r"CVE-\d{4}-\d+", re.IGNORECASE)
 _CWE_RE = re.compile(r"CWE-\d+", re.IGNORECASE)
+_QDRANT_CLIENT = None
+
+
+def _load_env() -> None:
+    try:
+        from dotenv import load_dotenv
+    except Exception:
+        return
+    env_path = Path(__file__).resolve().parents[2] / ".env"
+    if env_path.exists():
+        load_dotenv(env_path, override=False)
+
+
+_load_env()
+
+
+def _qdrant_collection() -> str:
+    return os.getenv("QDRANT_COLLECTION", "vuln_kg_evidence_v1").strip() or "vuln_kg_evidence_v1"
 
 
 def _clamp01(value: float) -> float:
@@ -303,62 +339,27 @@ def _graph_candidates(entity: GraphEntity, top_k: int, max_hops: int = 2) -> lis
     return rows
 
 
-_EMBED_MODEL = None
-_EMBED_BACKEND = ""
-
-
 def _embed_query(text: str) -> list[float]:
-    global _EMBED_MODEL, _EMBED_BACKEND
-    model_name = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
-
-    if _EMBED_MODEL is None:
-        try:
-            from fastembed import TextEmbedding
-
-            _EMBED_MODEL = TextEmbedding(model_name=model_name)
-            _EMBED_BACKEND = "fastembed"
-        except Exception:
-            from sentence_transformers import SentenceTransformer
-
-            _EMBED_MODEL = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-            _EMBED_BACKEND = "sentence-transformers"
-
-    if _EMBED_BACKEND == "fastembed":
-        vector = list(_EMBED_MODEL.embed([text]))[0]
-        return [float(x) for x in vector]
-    vector = _EMBED_MODEL.encode([text], normalize_embeddings=True)[0]
-    return [float(x) for x in vector.tolist()]
+    return shared_embed_query(text)
 
 
 def _get_qdrant_client():
-    try:
-        from qdrant_client import QdrantClient
-    except Exception:
-        return None
-
-    qdrant_url = os.getenv("QDRANT_URL", "").strip()
-    qdrant_api_key = os.getenv("QDRANT_API_KEY", "").strip() or None
-    if qdrant_url:
-        return QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
-
-    qdrant_path = os.getenv("QDRANT_PATH", str(Path("data") / "qdrant"))
-    Path(qdrant_path).mkdir(parents=True, exist_ok=True)
-    return QdrantClient(path=qdrant_path)
+    global _QDRANT_CLIENT
+    if _QDRANT_CLIENT is not None:
+        return _QDRANT_CLIENT
+    _QDRANT_CLIENT = get_qdrant_client(required=False)
+    return _QDRANT_CLIENT
 
 
-def _vector_candidates(query: str, entity: GraphEntity, top_k: int) -> list[dict[str, Any]]:
-    client = _get_qdrant_client()
-    if not client:
-        return []
+def _search_qdrant(client, query: str, top_k: int) -> list[dict[str, Any]]:
     try:
         query_vector = _embed_query(query)
     except Exception:
         return []
 
-    collection = os.getenv("QDRANT_COLLECTION", "vuln_kg_evidence_v1")
     try:
         hits = client.search(
-            collection_name=collection,
+            collection_name=_qdrant_collection(),
             query_vector=query_vector,
             limit=top_k,
             with_payload=True,
@@ -366,23 +367,86 @@ def _vector_candidates(query: str, entity: GraphEntity, top_k: int) -> list[dict
     except Exception:
         return []
 
+    out: list[dict[str, Any]] = []
+    for hit in hits or []:
+        payload = {}
+        if isinstance(hit, dict):
+            payload = hit.get("payload", {}) or {}
+            score = float(hit.get("score", 0.0) or 0.0)
+            point_id = str(hit.get("id", ""))
+        else:
+            payload = getattr(hit, "payload", {}) or {}
+            score = float(getattr(hit, "score", 0.0) or 0.0)
+            point_id = str(getattr(hit, "id", ""))
+        out.append({"id": point_id, "score": score, "payload": payload})
+    return out
+
+
+def _coerce_list(value: Any, max_items: int = 5) -> list[str]:
+    if isinstance(value, list):
+        return [str(x) for x in value[:max_items]]
+    if value in (None, ""):
+        return []
+    return [str(value)]
+
+
+def _payload_cve_ids(payload: dict[str, Any]) -> list[str]:
+    try:
+        max_items = max(1, int(os.getenv("GRAPHRAG_DATASET_GROUP_SIZE", "10")))
+    except Exception:
+        max_items = 10
+    out: list[str] = []
+    raw_ids = payload.get("cve_ids", [])
+    if isinstance(raw_ids, list):
+        for item in raw_ids:
+            c = str(item).upper().strip()
+            if c and c not in out:
+                out.append(c)
+    primary = str(payload.get("cve_id") or payload.get("target_cve") or "").upper().strip()
+    if primary and primary not in out:
+        out.insert(0, primary)
+    return out[:max_items]
+
+
+def _vector_candidates(query: str, entity: GraphEntity, top_k: int) -> list[dict[str, Any]]:
+    client = _get_qdrant_client()
+    if not client:
+        return []
+
+    try:
+        search_top_k = int(os.getenv("QDRANT_TOP_K", str(top_k)))
+    except Exception:
+        search_top_k = top_k
+    search_top_k = max(1, min(search_top_k, 100))
+
+    text_field = os.getenv("QDRANT_TEXT_FIELD", "chunk_text").strip() or "chunk_text"
+    hits = _search_qdrant(client, query=query, top_k=search_top_k)
+    source_mode = "qdrant_vector"
+
     out = []
     for h in hits:
-        payload = h.payload or {}
-        cve_id = str(payload.get("cve_id") or payload.get("target_cve") or "").upper().strip()
-        if not cve_id:
+        payload = h.get("payload") or {}
+        if not isinstance(payload, dict):
             continue
-        out.append(
-            {
-                "cve_id": cve_id,
-                "score": _clamp01(float(h.score)),
-                "rel_type": str(payload.get("rel_type", "VECTOR_SIMILARITY")),
-                "signals": payload.get("signals", []),
-                "reasons": payload.get("reasons", []),
-                "source_type": str(payload.get("source_type", "vector")),
-                "snippet": str(payload.get("text", ""))[:280],
-            }
-        )
+        cve_ids = _payload_cve_ids(payload)
+        if not cve_ids:
+            continue
+        base_score = _clamp01(float(h.get("score", 0.0) or 0.0))
+        group_penalty = 1.0 / (max(1, min(len(cve_ids), 10)) ** 0.5)
+        score = _clamp01(base_score * group_penalty)
+        snippet = str(payload.get(text_field) or payload.get("text") or payload.get("chunk_text") or "")[:280]
+        for cve_id in cve_ids:
+            out.append(
+                {
+                    "cve_id": cve_id,
+                    "score": score,
+                    "rel_type": str(payload.get("rel_type", "VECTOR_SIMILARITY")),
+                    "signals": _coerce_list(payload.get("signals", []), max_items=5),
+                    "reasons": _coerce_list(payload.get("reasons", []), max_items=3),
+                    "source_type": str(payload.get("source_type", source_mode)),
+                    "snippet": snippet,
+                }
+            )
     return out
 
 
