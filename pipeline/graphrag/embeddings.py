@@ -36,7 +36,45 @@ def _model_name() -> str:
 
 
 def resolve_embedding_device() -> str:
-    # CPU-only pipeline by design for predictable memory/throughput on constrained machines.
+    """Resolve the effective embedding device from EMBEDDING_DEVICE env var.
+
+    Values:
+      cpu          → always CPU (default)
+      cuda / gpu   → CUDA if available, falls back to CPU
+      auto         → CUDA if available, then MPS (Apple Silicon), then CPU
+      mps          → Apple MPS if available, falls back to CPU
+    """
+    requested = os.getenv("EMBEDDING_DEVICE", "cpu").strip().lower() or "cpu"
+
+    if requested in ("cuda", "gpu"):
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return "cuda"
+        except Exception:
+            pass
+        return "cpu"
+
+    if requested == "auto":
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return "cuda"
+            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                return "mps"
+        except Exception:
+            pass
+        return "cpu"
+
+    if requested == "mps":
+        try:
+            import torch
+            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                return "mps"
+        except Exception:
+            pass
+        return "cpu"
+
     return "cpu"
 
 
