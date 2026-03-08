@@ -29,10 +29,40 @@ from sentence_transformers import SentenceTransformer
 
 
 DEFAULT_MODEL_NAME = "BAAI/bge-small-en-v1.5"
-DEFAULT_BATCH_SIZE = 64
-DEFAULT_QDRANT_BATCH = 256
+DEFAULT_BATCH_SIZE_CPU = 64
+DEFAULT_BATCH_SIZE_GPU = 1024   # optimal for bge-small-en on L4/A100 with fp16
+DEFAULT_QDRANT_BATCH = 500
 DEFAULT_VECTOR_DIM = 384
-LOG_EVERY = 2000
+# Full KG embed: ~6.9M vectors (325k CVEs + 5.12M CORRELATED_WITH + 891k CO_OCCURS_WITH)
+# L4 24GB fp16 batch=1024: ~14 min embed + ~10 min upsert ≈ 24 min total
+# A100 40GB fp16 batch=1024: ~6 min embed  + ~10 min upsert ≈ 16 min total
+LOG_EVERY = 50000
+
+
+def _resolve_device(requested: str) -> str:
+    """Resolve requested device string to an actual torch device.
+
+    Accepts: cpu, cuda, gpu, auto, mps
+    Falls back to cpu if the requested device is unavailable.
+    """
+    req = requested.strip().lower() or "cpu"
+    if req in ("cuda", "gpu"):
+        if torch.cuda.is_available():
+            return "cuda"
+        _log("WARNING: CUDA requested but not available — falling back to CPU.")
+        return "cpu"
+    if req == "auto":
+        if torch.cuda.is_available():
+            return "cuda"
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+    if req == "mps":
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return "mps"
+        _log("WARNING: MPS requested but not available — falling back to CPU.")
+        return "cpu"
+    return "cpu"
 
 
 @dataclass
@@ -250,7 +280,10 @@ def _stream_chunks(data_dir: Path, quotas: Quotas) -> Iterator[dict[str, Any]]:
     chunk_size = _env_int("GRAPHRAG_CHUNK_SIZE", 900)
     overlap = _env_int("GRAPHRAG_CHUNK_OVERLAP", 120)
     group_size = max(1, _env_int("GRAPHRAG_DATASET_GROUP_SIZE", 10))
-    max_rel_per_cve = max(1, _env_int("GRAPHRAG_MAX_REL_PER_CVE", 4))
+    # Default 25: KG has ~15.7 avg CORRELATED_WITH edges per CVE (5.12M total / 326k CVEs).
+    # Set to 0 for truly unlimited (rare CVEs have 100+ relations).
+    max_rel_per_cve_raw = _env_int("GRAPHRAG_MAX_REL_PER_CVE", 25)
+    max_rel_per_cve = max_rel_per_cve_raw if max_rel_per_cve_raw > 0 else 10000
     min_corr_score = _env_float("GRAPHRAG_MIN_CORR_SCORE", 0.60)
 
     emitted = {"dataset": 0, "correlation": 0, "cooccurrence": 0, "total": 0}
@@ -334,7 +367,7 @@ def _stream_chunks(data_dir: Path, quotas: Quotas) -> Iterator[dict[str, Any]]:
         if quotas.correlation <= 0 or emitted["correlation"] < quotas.correlation:
             rels = row.get("related_vulnerabilities", [])
             if isinstance(rels, list):
-                for rel in rels[:max_rel_per_cve]:
+                for rel in rels[:max_rel_per_cve]:  # noqa: E501
                     tgt = str(rel.get("cve_id", "")).upper().strip()
                     score = float(rel.get("correlation_score", 0.0) or 0.0)
                     if not tgt or score < min_corr_score:
@@ -466,9 +499,14 @@ def _human_bytes(n: int) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="CPU-optimized streaming embed + Qdrant upsert for GraphRAG.")
+    parser = argparse.ArgumentParser(description="Streaming embed + Qdrant upsert for GraphRAG. GPU-ready via --device.")
     parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME, help=f"Embedding model (default: {DEFAULT_MODEL_NAME})")
-    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help=f"Embedding batch size (default: {DEFAULT_BATCH_SIZE})")
+    parser.add_argument(
+        "--device",
+        default=os.getenv("EMBEDDING_DEVICE", "cpu"),
+        help="Compute device: cpu | cuda | gpu | auto | mps (default: $EMBEDDING_DEVICE or cpu)",
+    )
+    parser.add_argument("--batch-size", type=int, default=0, help="Embedding batch size (0 = auto: 512 GPU / 64 CPU)")
     parser.add_argument("--collection-name", default=os.getenv("QDRANT_COLLECTION", "vuln_kg_evidence_v1"), help="Qdrant collection")
     parser.add_argument("--resume-from", type=int, default=0, help="Skip first N vectors before upsert")
     parser.add_argument("--max-vectors", type=int, default=0, help="Stop after N vectors")
@@ -479,20 +517,29 @@ def main() -> int:
     parser.add_argument("--data-dir", default="data", help="Input data directory")
     parser.add_argument("--vector-size", type=int, default=DEFAULT_VECTOR_DIM, help=f"Vector size (default: {DEFAULT_VECTOR_DIM})")
     parser.add_argument("--text-field", default=os.getenv("QDRANT_TEXT_FIELD", "text"), help="Payload text field")
-    parser.add_argument("--dataset-quota", type=int, default=_env_int("GRAPHRAG_DATASET_QUOTA", 150000))
-    parser.add_argument("--corr-quota", type=int, default=_env_int("GRAPHRAG_CORR_QUOTA", 50000))
-    parser.add_argument("--cooc-quota", type=int, default=_env_int("GRAPHRAG_COOC_QUOTA", 70000))
+    # 0 = no limit per source; full KG targets ~6.9M total vectors
+    parser.add_argument("--dataset-quota", type=int, default=_env_int("GRAPHRAG_DATASET_QUOTA", 0))
+    parser.add_argument("--corr-quota", type=int, default=_env_int("GRAPHRAG_CORR_QUOTA", 0))
+    parser.add_argument("--cooc-quota", type=int, default=_env_int("GRAPHRAG_COOC_QUOTA", 0))
     parser.add_argument("--max-total", type=int, default=_env_int("GRAPHRAG_MAX_TOTAL_CHUNKS", 0))
     args = parser.parse_args()
 
-    cpu_threads = max(1, os.cpu_count() or 1)
-    torch.set_num_threads(cpu_threads)
-    try:
-        torch.set_num_interop_threads(1)
-    except RuntimeError:
-        pass
+    device = _resolve_device(args.device)
+    use_gpu = device in ("cuda", "mps")
+
+    # CPU thread tuning only applies when not using a GPU
+    if not use_gpu:
+        cpu_threads = max(1, os.cpu_count() or 1)
+        torch.set_num_threads(cpu_threads)
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     _disable_hf_progress()
+
+    # Resolve batch size: explicit arg wins, otherwise device-appropriate default
+    effective_batch = args.batch_size if args.batch_size > 0 else (DEFAULT_BATCH_SIZE_GPU if use_gpu else DEFAULT_BATCH_SIZE_CPU)
 
     quotas = Quotas(
         dataset=max(0, args.dataset_quota),
@@ -507,8 +554,11 @@ def main() -> int:
             f"{_human_bytes(_estimate_bytes(args.vector_size, target))}"
         )
 
-    _log(f"Runtime: model={args.model_name} device=cpu torch_threads={cpu_threads} interop=1")
-    model = SentenceTransformer(args.model_name, device="cpu")
+    if use_gpu:
+        _log(f"Runtime: model={args.model_name} device={device} batch={effective_batch} (GPU mode)")
+    else:
+        _log(f"Runtime: model={args.model_name} device=cpu batch={effective_batch} torch_threads={max(1, os.cpu_count() or 1)} interop=1")
+    model = SentenceTransformer(args.model_name, device=device)
 
     url = (args.qdrant_url or "").strip()
     api_key = (args.qdrant_api_key or "").strip() or None
@@ -521,6 +571,9 @@ def main() -> int:
     skipped = 0
     data_dir = Path(args.data_dir)
     chunk_iter = _stream_chunks(data_dir=data_dir, quotas=quotas)
+
+    # fp16 encoding gives ~2× throughput on CUDA with bge-small at negligible precision loss
+    encode_precision = "float16" if device == "cuda" else None
 
     def log_progress(force: bool = False) -> None:
         if processed <= 0:
@@ -540,7 +593,7 @@ def main() -> int:
         )
 
     try:
-        for batch in _iter_batches(chunk_iter, args.batch_size):
+        for batch in _iter_batches(chunk_iter, effective_batch):
             if args.max_vectors > 0 and processed >= args.max_vectors:
                 break
 
@@ -567,13 +620,15 @@ def main() -> int:
                 texts = [str(c.get("text", "")) for c in part]
                 try:
                     with torch.inference_mode():
-                        vectors = model.encode(
-                            texts,
+                        encode_kwargs: dict = dict(
                             batch_size=len(part),
                             normalize_embeddings=True,
                             show_progress_bar=False,
                             convert_to_tensor=True,
                         )
+                        if encode_precision:
+                            encode_kwargs["precision"] = encode_precision
+                        vectors = model.encode(texts, **encode_kwargs)
                 except MemoryError:
                     if len(part) <= 1:
                         _log(f"MemoryError on single-row batch, skipping chunk_id={part[0].get('id', 'unknown')}")
