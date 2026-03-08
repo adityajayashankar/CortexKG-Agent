@@ -403,6 +403,4 @@ Output: `data/training_pairs_augmented_1gb.jsonl`
 ## Open Items
 
 1. ExploitDB crawler currently returns 0 records (all known mirror URLs are failing). Contributions welcome.
-2. `execution_context` training layer is slightly thin (~195 pairs vs 200 threshold). `generate_synthetic_pairs.py` expands it automatically; re-run if needed.
-3. Rotate any API keys or tokens that were previously exposed in plain-text configs.
 
