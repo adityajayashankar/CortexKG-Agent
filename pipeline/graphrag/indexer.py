@@ -85,7 +85,9 @@ def _hash(text: str) -> str:
 
 def _split_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
     """
-    Character-window chunking with overlap and whitespace boundary preference.
+    Structural-aware chunking: prefer breaking at field boundaries (newlines,
+    bullet points, section headers) before falling back to whitespace splits.
+    This preserves semantic units in structured vulnerability data.
     """
     t = " ".join(str(text or "").split()).strip()
     if not t:
@@ -96,15 +98,29 @@ def _split_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OV
     if len(t) <= chunk_size:
         return [t]
 
+    # Structural break patterns (ordered by preference: strongest first)
+    _BREAK_PATTERNS = ["\n\n", "\n", " • ", " - ", ". ", ", "]
+
     out: list[str] = []
     start = 0
     n = len(t)
     while start < n:
         end = min(start + chunk_size, n)
         if end < n:
-            ws = t.rfind(" ", start + int(chunk_size * 0.65), end)
-            if ws > start:
-                end = ws
+            # Try structural breaks first, then fall back to whitespace
+            best_break = -1
+            search_start = start + int(chunk_size * 0.5)
+            for pattern in _BREAK_PATTERNS:
+                pos = t.rfind(pattern, search_start, end)
+                if pos > start:
+                    best_break = pos + len(pattern)
+                    break
+            if best_break > start:
+                end = best_break
+            else:
+                ws = t.rfind(" ", search_start, end)
+                if ws > start:
+                    end = ws
         chunk = t[start:end].strip()
         if chunk:
             out.append(chunk)

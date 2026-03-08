@@ -100,22 +100,28 @@ def _normalize_entity(query: str, entity: dict[str, Any] | None) -> GraphEntity:
 
 
 def _get_neo4j_driver():
+    """Delegate to the shared Neo4j singleton in pipeline.neo4j_conn."""
     try:
-        from neo4j import GraphDatabase
-    except Exception:
-        return None
-    uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-    user = os.getenv("NEO4J_USER", "neo4j")
-    password = os.getenv("NEO4J_PASSWORD", "").strip()
-    if not password:
-        return None
-    try:
-        driver = GraphDatabase.driver(uri, auth=(user, password))
-        with driver.session() as s:
-            s.run("RETURN 1")
-        return driver
-    except Exception:
-        return None
+        from pipeline.neo4j_conn import get_neo4j_driver
+        return get_neo4j_driver()
+    except ImportError:
+        # Fallback for isolated script execution
+        try:
+            from neo4j import GraphDatabase
+        except Exception:
+            return None
+        uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+        user = os.getenv("NEO4J_USER", "neo4j")
+        password = os.getenv("NEO4J_PASSWORD", "").strip()
+        if not password:
+            return None
+        try:
+            driver = GraphDatabase.driver(uri, auth=(user, password))
+            with driver.session() as s:
+                s.run("RETURN 1")
+            return driver
+        except Exception:
+            return None
 
 
 def _query_cve_neighbors(session, cve_id: str, top_k: int) -> list[dict[str, Any]]:
@@ -580,7 +586,21 @@ def retrieve_hybrid(
     direct, inferred, citations = _fuse_candidates(graph_rows, vector_rows, top_k)
 
     top_scores = [e.likelihood for e in (direct + inferred)[:5]]
-    overall = round(sum(top_scores) / max(len(top_scores), 1), 3) if top_scores else 0.0
+    # Calibrated confidence: weighted harmonic mean penalizes sparse evidence
+    # and prevents one strong signal from inflating overall confidence.
+    if top_scores:
+        n = len(top_scores)
+        # Direct evidence ratio bonus: more direct evidence = higher confidence
+        direct_ratio = len(direct) / max(len(direct) + len(inferred), 1)
+        # Harmonic mean of top scores (punishes outlier-dominated distributions)
+        harmonic_denom = sum(1.0 / max(s, 0.01) for s in top_scores)
+        harmonic_mean = n / harmonic_denom if harmonic_denom > 0 else 0.0
+        # Blend arithmetic and harmonic: arithmetic rewards breadth, harmonic rewards consistency
+        arith_mean = sum(top_scores) / n
+        calibrated = 0.4 * harmonic_mean + 0.4 * arith_mean + 0.2 * direct_ratio
+        overall = round(_clamp01(calibrated), 3)
+    else:
+        overall = 0.0
     if use_vector:
         rationale = (
             f"Hybrid retrieval fused {len(graph_rows)} graph candidates and {len(vector_rows)} vector candidates (max_hops={max_hops})."
