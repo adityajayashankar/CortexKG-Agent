@@ -1,5 +1,5 @@
-# Vulnerability GraphRAG Pipeline (Qdrant + Neo4j)
-
+# Vulnerability GraphRAG Agent
+peline
 Complete run order from scratch on Windows PowerShell. Covers data collection, KG build, vector indexing, agent runtime, and optional fine-tuning.
 
 ## Architecture Overview
