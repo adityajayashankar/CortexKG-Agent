@@ -25,27 +25,54 @@ DEFAULT_OUTPUT = "training_pairs_augmented_1gb.jsonl"
 DEFAULT_SOURCE = "training_pairs.jsonl"
 
 PRIORITY_LAYERS = {"vulnerability_correlation", "vulnerability_cooccurrence"}
-INSTRUCTION_PREFIXES = [
-    "Follow-up assessment:",
-    "Correlation expansion task:",
-    "Threat-hunting context:",
-    "Red-team validation:",
-    "Blue-team triage:",
-]
-OUTPUT_SUFFIXES = [
-    (
-        "Validation checklist: confirm asset ownership, verify patch state, "
-        "map related components, execute targeted exploit simulation, and "
-        "record evidence links for audit traceability."
-    ),
-    (
-        "Operational note: prioritize direct evidence first, then test inferred "
-        "candidates with constrained scope scans before escalating remediation."
-    ),
-    (
-        "Evidence hygiene: keep citation IDs stable, preserve source metadata, "
-        "and separate confirmed findings from hypothesis-driven candidates."
-    ),
+
+# Scenario-based semantic reframing templates (not boilerplate prefixes)
+SCENARIO_TEMPLATES = [
+    # Incident response scenario
+    {
+        "prefix": "During an active incident response, our SOC team needs to know: ",
+        "suffix": (
+            "\n\nIncident Response Priority: Validate findings against SIEM alerts, "
+            "correlate with network traffic logs, and escalate confirmed IOCs to "
+            "threat intelligence team."
+        ),
+    },
+    # Red team scenario
+    {
+        "prefix": "As part of a red team engagement targeting this environment: ",
+        "suffix": (
+            "\n\nRed Team Note: Chain this finding with adjacent attack surfaces. "
+            "Document exploitation path for debrief and validate that blue team "
+            "detection coverage triggers on this vector."
+        ),
+    },
+    # Compliance audit scenario
+    {
+        "prefix": "For a compliance audit against SOC 2 / ISO 27001 controls: ",
+        "suffix": (
+            "\n\nCompliance Mapping: Document control gap, map to framework requirement, "
+            "and include evidence of testing methodology and remediation timeline "
+            "in the audit workpaper."
+        ),
+    },
+    # Threat hunting scenario
+    {
+        "prefix": "When proactively threat hunting for this attack pattern: ",
+        "suffix": (
+            "\n\nThreat Hunting Checklist: Query EDR for process execution anomalies, "
+            "check DNS logs for C2 beacon patterns, and review authentication logs "
+            "for lateral movement indicators."
+        ),
+    },
+    # Vulnerability management scenario
+    {
+        "prefix": "For vulnerability management prioritization and patch scheduling: ",
+        "suffix": (
+            "\n\nPatch Prioritization: Factor in asset criticality, exposure level, "
+            "and compensating controls when scheduling remediation windows. "
+            "Verify patch effectiveness with post-deployment validation scan."
+        ),
+    },
 ]
 
 
@@ -78,24 +105,24 @@ def mutate_record(base: dict, idx: int, rng: random.Random) -> dict:
     output = str(rec.get("output", "")).strip()
     input_text = str(rec.get("input", "")).strip()
 
-    prefix = INSTRUCTION_PREFIXES[idx % len(INSTRUCTION_PREFIXES)]
-    suffix = OUTPUT_SUFFIXES[idx % len(OUTPUT_SUFFIXES)]
+    template = SCENARIO_TEMPLATES[idx % len(SCENARIO_TEMPLATES)]
+    prefix = template["prefix"]
+    suffix = template["suffix"]
 
     if instruction:
-        rec["instruction"] = f"{prefix} {instruction}"
+        rec["instruction"] = f"{prefix}{instruction[0].lower()}{instruction[1:]}" if len(instruction) > 1 else f"{prefix}{instruction}"
     elif input_text:
-        rec["instruction"] = f"{prefix} {input_text[:220]}"
+        rec["instruction"] = f"{prefix}{input_text[:220]}"
     else:
         rec["instruction"] = (
-            f"{prefix} Expand related vulnerability testing for correlated attack surface."
+            f"{prefix}assess the correlated attack surface for this vulnerability."
         )
 
     if output:
-        rec["output"] = f"{output}\n\n{suffix}\nAugmentation-ID: AUG-{idx:09d}"
+        rec["output"] = f"{output}{suffix}"
     else:
         rec["output"] = (
-            f"{suffix}\nAugmentation-ID: AUG-{idx:09d}\n"
-            "No base output was present; generated operational guidance only."
+            f"Analysis pending — insufficient base data for augmentation.{suffix}"
         )
 
     rec["augmentation_id"] = f"AUG-{idx:09d}"

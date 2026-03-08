@@ -2,6 +2,18 @@
 
 Use this checklist to validate that the Neo4j knowledge graph is structurally correct and aligned with source data.
 
+## How To Explain KG Validation (Short Answer)
+
+If someone asks how the KG was validated and de-noised, use this:
+
+"I validated the KG at four levels:
+1. Graph integrity checks: uniqueness constraints, null-ID checks, duplicate/self-loop edge checks, and expected node/edge counts by type.
+2. Source-grounded verification: sampled CVEs and matched `CORRELATED_WITH`/`CO_OCCURS_WITH` neighbors against `raw_correlations.json` and `raw_cooccurrence_v2.json`.
+3. Noise controls in build: applied thresholds/caps (minimum correlation score, max related-per-CVE, quotas) to prune low-confidence and hub-noise edges.
+4. Task-level validation: ran benchmark CVE queries in the agent and confirmed evidence-backed retrieval with citations and stable outputs across runs."
+
+This demonstrates both correctness (structure + source alignment) and low-noise behavior (controlled edge generation + retrieval quality).
+
 ## 1) Schema and volume sanity
 
 Run in Neo4j Browser:

@@ -591,7 +591,7 @@ def build_record(
     cvss   = nvd_rec.get("cvss_score", "")
     sev    = nvd_rec.get("cvss_severity", "")
 
-    owasp_cat   = get_owasp_category(cwe_id)
+    owasp_cat   = get_owasp_category(cwe_id, desc)
     pentest     = get_pentest_intel(owasp_cat)
     epss_score  = epss_map.get(cve_id, "")
     gh_advisory = github_map.get(cve_id, {})
@@ -655,7 +655,7 @@ def build_record(
         "vulnerability_name":  nvd_rec.get("vulnerability_name", cve_id),
         "cwe_id":              cwe_id,
         "description":         desc,
-        "owasp_category":      get_owasp_category(cwe_id) if cwe_id else owasp_cat,
+        "owasp_category":      get_owasp_category(cwe_id, desc) if cwe_id else owasp_cat,
         "cvss_score":          cvss,
         "cvss_severity":       sev,
         "epss_score":          epss_score,
@@ -791,6 +791,27 @@ def to_training_pairs(record: dict) -> list:
             "agent": "Tool Selector Agent",
         })
 
+    # L4b: Exploitation workflow context
+    if method and desc:
+        pairs.append({
+            "instruction": f"Describe the exploitation workflow and detection strategy for {cve}.",
+            "input":       desc,
+            "output":      (
+                f"Exploitation Workflow for {cve}:\n\n"
+                f"1. Attack Vector: {method}\n"
+                f"2. Detection Signals: {sigs or 'Monitor for anomalous behavior patterns'}\n"
+                f"3. OWASP Category: {owasp}\n"
+                f"4. Risk Level: {risk}\n\n"
+                f"Testing Execution:\n"
+                f"  Tool: {tool or 'Manual testing'}\n"
+                f"  Approach: Validate {owasp.split('-',1)[-1].strip() if '-' in owasp else owasp} "
+                f"controls are effective. {method[:200]}\n\n"
+                f"Detection: {sigs or 'Implement behavioral monitoring and log analysis.'}"
+            ),
+            "layer": "execution_context",
+            "agent": "Tool Selector Agent",
+        })
+
     # L5: Audit Evidence
     if cvss:
         pairs.append({
@@ -818,6 +839,30 @@ def to_training_pairs(record: dict) -> list:
                 f"Remediation: {fix}\n\n"
                 f"Root Cause: {ctrl}\n"
                 f"Control Type: Technical"
+            ),
+            "layer": "remediation_learning",
+            "agent": "Reflector Agent",
+        })
+
+    # L6b: Root-cause and prevention-oriented remediation
+    if ctrl and cwe:
+        pairs.append({
+            "instruction": (
+                f"What is the root cause of {cve} and how should it be prevented "
+                f"in future development?"
+            ),
+            "input":       desc,
+            "output":      (
+                f"Root Cause Analysis for {cve}:\n\n"
+                f"Weakness: {cwe}\n"
+                f"Security Control Gap: {ctrl}\n"
+                f"OWASP Category: {owasp}\n\n"
+                f"Prevention Strategy:\n"
+                f"  1. Fix: {fix[:300]}\n"
+                f"  2. Secure Development: Address {cwe} through secure coding "
+                f"standards and code review checklists.\n"
+                f"  3. Continuous Monitoring: Implement detection for "
+                f"{sigs or 'indicators of exploitation'} to catch regression."
             ),
             "layer": "remediation_learning",
             "agent": "Reflector Agent",
@@ -1373,6 +1418,197 @@ def _safe_write_jsonl(records: list, out_path: str):
     Path(tmp).replace(out_path)
 
 
+def _load_mitre_lookups(script_dir: Path) -> tuple[dict, dict, list, list]:
+    """
+    Load MITRE ATT&CK data and build CVE→techniques and CWE→CAPEC lookups.
+    Returns (cve_to_techniques, cwe_to_capec, techniques_list, capec_list).
+    """
+    mitre_path = script_dir / "raw_mitre_attack.json"
+    if not mitre_path.exists():
+        print("  ⚠️  raw_mitre_attack.json not found — ATT&CK enrichment disabled")
+        return {}, {}, [], []
+    try:
+        with open(mitre_path, encoding="utf-8") as f:
+            mitre_data = json.load(f)
+    except Exception as e:
+        print(f"  ⚠️  MITRE ATT&CK load failed: {e}")
+        return {}, {}, [], []
+
+    techniques = mitre_data.get("techniques", [])
+    capec_list = mitre_data.get("capec_patterns", [])
+    cve_to_tech = mitre_data.get("cve_to_techniques", {})
+    cwe_to_capec = mitre_data.get("cwe_to_capec", {})
+    print(f"  ATT&CK techniques:     {len(techniques)}")
+    print(f"  CAPEC patterns:        {len(capec_list)}")
+    print(f"  CVE→ATT&CK mappings:   {len(cve_to_tech)}")
+    print(f"  CWE→CAPEC mappings:    {len(cwe_to_capec)}")
+
+    # Build technique lookup by ID for enrichment
+    tech_by_id = {t["technique_id"]: t for t in techniques if t.get("technique_id")}
+
+    return cve_to_tech, cwe_to_capec, techniques, capec_list
+
+
+def _enrich_record_with_mitre(record: dict, cve_to_tech: dict, cwe_to_capec: dict,
+                               tech_by_id: dict, capec_by_id: dict) -> dict:
+    """
+    Directly enrich a record with MITRE ATT&CK technique names and CAPEC patterns
+    if the correlation pipeline didn't already populate them.
+    """
+    cve_id = record.get("cve_id", "")
+    cwe_id = record.get("cwe_id", "")
+
+    # Enrich attack_techniques from cve_to_techniques lookup
+    if not record.get("attack_techniques"):
+        tech_ids = cve_to_tech.get(cve_id, [])
+        if tech_ids:
+            names = []
+            for tid in tech_ids[:8]:
+                t = tech_by_id.get(tid)
+                if t:
+                    tactic = t.get("tactic", "")
+                    names.append(f"{tid}: {t['technique_name']}" + (f" ({tactic})" if tactic else ""))
+                else:
+                    names.append(tid)
+            record["attack_techniques"] = names
+
+    # Enrich capec_patterns from cwe_to_capec lookup
+    if not record.get("capec_patterns") and cwe_id:
+        capec_ids = cwe_to_capec.get(cwe_id, [])
+        if capec_ids:
+            patterns = []
+            for cid in capec_ids[:6]:
+                c = capec_by_id.get(cid)
+                if c:
+                    patterns.append(f"{cid}: {c['name']}")
+                else:
+                    patterns.append(cid)
+            record["capec_patterns"] = patterns
+
+    return record
+
+
+def to_mitre_attack_pairs(record: dict, tech_by_id: dict, capec_by_id: dict) -> list:
+    """
+    Generate pentesting_intelligence, execution_context, and remediation_learning
+    pairs from MITRE ATT&CK technique and CAPEC pattern data on the record.
+    This directly boosts the three thinnest training layers.
+    """
+    cve_id = record.get("cve_id", "")
+    desc   = record.get("description", "")[:300]
+    owasp  = record.get("owasp_category", "")
+    pairs  = []
+
+    techniques = record.get("attack_techniques", [])
+    capec_patterns = record.get("capec_patterns", [])
+
+    # ── Pentesting pairs from ATT&CK techniques ────────────────────────
+    for tech_str in techniques[:4]:
+        tid = tech_str.split(":")[0].strip()
+        t = tech_by_id.get(tid, {})
+        if not t:
+            continue
+        tech_desc = t.get("description", "")[:600]
+        tactic = t.get("tactic", "Unknown")
+        platforms = ", ".join(t.get("platforms", [])[:5]) or "Multiple"
+        data_sources = ", ".join(t.get("data_sources", [])[:4]) or "Endpoint logs"
+        mitigations = t.get("mitigations", [])
+
+        # Pentesting intelligence from technique
+        pairs.append({
+            "instruction": (
+                f"How would an attacker exploit {cve_id} using ATT&CK technique {tid}? "
+                f"What detection opportunities exist?"
+            ),
+            "input": desc,
+            "output": (
+                f"ATT&CK Technique: {tid} — {t.get('technique_name', '')}\n"
+                f"Tactic: {tactic}\n"
+                f"Platforms: {platforms}\n\n"
+                f"Technique Description:\n{tech_desc[:400]}\n\n"
+                f"Detection Opportunities:\n"
+                f"  Data Sources: {data_sources}\n"
+                f"  Monitor for: Process creation, command-line arguments, and "
+                f"network connections associated with {tid} execution patterns.\n\n"
+                f"During penetration testing for {cve_id}, simulate {tid} behavior "
+                f"and verify detection coverage across {data_sources}."
+            ),
+            "layer": "pentesting_intelligence",
+            "agent": "Scanner Agent",
+        })
+
+        # Execution context from technique
+        pairs.append({
+            "instruction": (
+                f"What is the execution context for exploiting {cve_id} via {tid}?"
+            ),
+            "input": desc,
+            "output": (
+                f"Execution Context for {cve_id} ({tid}):\n\n"
+                f"Tactic Phase: {tactic}\n"
+                f"Target Platforms: {platforms}\n"
+                f"Technique: {t.get('technique_name', tid)}\n\n"
+                f"This vulnerability can be exploited as part of the {tactic.lower()} "
+                f"phase of an attack. The attacker would leverage {tid} on {platforms} "
+                f"systems. Detection should focus on: {data_sources}.\n\n"
+                f"Testing Tool Context: Use tools aligned to {tactic.lower()} simulation — "
+                f"validate that security controls detect {tid} execution patterns."
+            ),
+            "layer": "execution_context",
+            "agent": "Tool Selector Agent",
+        })
+
+        # Remediation from mitigations
+        if mitigations:
+            mit_lines = "\n".join(f"  • {m}" for m in mitigations[:5])
+            pairs.append({
+                "instruction": (
+                    f"What mitigations should be applied for {cve_id} to address "
+                    f"ATT&CK technique {tid}?"
+                ),
+                "input": desc,
+                "output": (
+                    f"MITRE ATT&CK Mitigations for {tid} ({t.get('technique_name', '')}):\n\n"
+                    + mit_lines
+                    + f"\n\nThese mitigations address the {tactic.lower()} tactic used to "
+                    f"exploit {cve_id}. Apply in priority order and validate with "
+                    f"detection rule testing against {data_sources}."
+                ),
+                "layer": "remediation_learning",
+                "agent": "Reflector Agent",
+            })
+
+    # ── Pentesting + remediation pairs from CAPEC patterns ──────────────
+    for capec_str in capec_patterns[:4]:
+        cid = capec_str.split(":")[0].strip()
+        c = capec_by_id.get(cid, {})
+        if not c:
+            continue
+        capec_desc = c.get("description", "")[:500]
+        severity = c.get("severity", "Medium")
+        likelihood = c.get("likelihood", "Medium")
+
+        pairs.append({
+            "instruction": (
+                f"Describe the CAPEC attack pattern relevant to {cve_id} and "
+                f"how to test for it."
+            ),
+            "input": desc,
+            "output": (
+                f"CAPEC Attack Pattern: {cid} — {c.get('name', '')}\n"
+                f"Severity: {severity} | Likelihood: {likelihood}\n\n"
+                f"Description:\n{capec_desc[:400]}\n\n"
+                f"Testing Approach: Simulate {cid} attack pattern against the "
+                f"vulnerable component. Verify that WAF rules, input validation, "
+                f"and monitoring detect the attack vector described above."
+            ),
+            "layer": "pentesting_intelligence",
+            "agent": "Scanner Agent",
+        })
+
+    return pairs
+
+
 def run():
     # Resolve all paths relative to this script's directory so the output
     # lands in the right place regardless of the working directory.
@@ -1393,6 +1629,11 @@ def run():
     exploitdb_map = build_exploitdb_lookup(_p("raw_exploitdb.json"))
     corr_lookup   = build_correlations_lookup(_p("raw_correlations.json"))
     vendor_lookup = build_vendor_lookup(_p("raw_vendor_advisories.json"))
+
+    # ── Load MITRE ATT&CK data for direct enrichment ──────────────────────
+    cve_to_tech, cwe_to_capec, techniques_list, capec_list = _load_mitre_lookups(script_dir)
+    tech_by_id  = {t["technique_id"]: t for t in techniques_list if t.get("technique_id")}
+    capec_by_id = {c["capec_id"]: c for c in capec_list if c.get("capec_id")}
 
     print(f"  NVD records:           {len(nvd_records)}")
     print(f"  EPSS entries:          {len(epss_map)}")
@@ -1423,6 +1664,8 @@ def run():
                               papers_map, closed_map, kev_map, exploitdb_map)
         record = enrich_with_correlations(record, corr_lookup)
         record = enrich_with_vendor_advisories(record, vendor_lookup)
+        record = _enrich_record_with_mitre(record, cve_to_tech, cwe_to_capec,
+                                           tech_by_id, capec_by_id)
 
         full_records.append(record)
 
@@ -1435,6 +1678,7 @@ def run():
         training_pairs.extend(to_cwe_family_pairs(record))            # fires for ~30% of records
         training_pairs.extend(to_kev_correlation_pairs(record))       # fires for KEV records only
         training_pairs.extend(to_blog_cooccurrence_pairs(record, blog_map))  # blog CVE pairs & chains
+        training_pairs.extend(to_mitre_attack_pairs(record, tech_by_id, capec_by_id))  # ATT&CK enrichment
 
     # ── Pass 2: CISA KEV entries not in NVD batch ──────────────────────────
     kev_only_count = 0
@@ -1466,6 +1710,8 @@ def run():
                               papers_map, closed_map, kev_map, exploitdb_map)
         record = enrich_with_correlations(record, corr_lookup)
         record = enrich_with_vendor_advisories(record, vendor_lookup)
+        record = _enrich_record_with_mitre(record, cve_to_tech, cwe_to_capec,
+                                           tech_by_id, capec_by_id)
 
         full_records.append(record)
         training_pairs.extend(to_training_pairs(record))
@@ -1474,6 +1720,7 @@ def run():
         training_pairs.extend(to_cwe_family_pairs(record))
         training_pairs.extend(to_kev_correlation_pairs(record))
         training_pairs.extend(to_blog_cooccurrence_pairs(record, blog_map))  # blog CVE pairs & chains
+        training_pairs.extend(to_mitre_attack_pairs(record, tech_by_id, capec_by_id))
         kev_only_count += 1
 
     print(f"  KEV-only records added (not in NVD batch): {kev_only_count}")
@@ -1515,6 +1762,8 @@ def run():
                               papers_map, closed_map, kev_map, exploitdb_map)
         record = enrich_with_correlations(record, corr_lookup)
         record = enrich_with_vendor_advisories(record, vendor_lookup)
+        record = _enrich_record_with_mitre(record, cve_to_tech, cwe_to_capec,
+                                           tech_by_id, capec_by_id)
 
         full_records.append(record)
         training_pairs.extend(to_training_pairs(record))
@@ -1522,6 +1771,7 @@ def run():
         training_pairs.extend(to_owasp_cooccurrence_pairs(record))
         training_pairs.extend(to_cwe_family_pairs(record))
         training_pairs.extend(to_blog_cooccurrence_pairs(record, blog_map))  # blog CVE pairs & chains
+        training_pairs.extend(to_mitre_attack_pairs(record, tech_by_id, capec_by_id))
         ghsa_only_count += 1
 
     print(f"  GHSA-only records added (no CVE ID):       {ghsa_only_count}")

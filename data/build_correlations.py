@@ -36,7 +36,8 @@ from typing import Optional
 # clamped to [0.1, 1.0].  Groups with >N members effectively get ~0.1.
 
 IDF_LARGE_GROUP_THRESHOLD = 100  # groups above this start getting penalised
-MAX_RELATED_DEFAULT = int(os.getenv("CORR_MAX_RELATED", "20"))
+MAX_RELATED_DEFAULT = int(os.getenv("CORR_MAX_RELATED", "40"))
+MIN_CORR_SCORE_DEFAULT = float(os.getenv("CORR_MIN_SCORE", "0.15"))
 MAX_CWE_MEMBERS = int(os.getenv("CORR_MAX_CWE_MEMBERS", "600"))
 MAX_PRODUCT_MEMBERS = int(os.getenv("CORR_MAX_PRODUCT_MEMBERS", "500"))
 MAX_ATTACK_MEMBERS = int(os.getenv("CORR_MAX_ATTACK_MEMBERS", "400"))
@@ -372,6 +373,7 @@ def build_correlation_record(
             "signals":          list(set(signals)),
         }
         for rel_cve, signals in scored[:max_related]
+        if _score_signals(rel_cve, signals) >= MIN_CORR_SCORE_DEFAULT
     ]
 
     return {

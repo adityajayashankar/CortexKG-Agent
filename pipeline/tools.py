@@ -32,15 +32,12 @@ from pathlib import Path
 
 from pipeline.model_loader import ask_model
 
-# ── Neo4j connection (lazy — only imported if KG tools are called) ─────────
+# ── Neo4j connection (shared singleton from pipeline.neo4j_conn) ────────
 
-_NEO4J_DRIVER = None
+from pipeline.neo4j_conn import get_neo4j_driver as _get_neo4j_driver
+
 _CVE_ID_RE = re.compile(r"^CVE-\d{4}-\d+$", re.IGNORECASE)
 _CWE_ID_RE = re.compile(r"^CWE-\d+$", re.IGNORECASE)
-
-
-def _is_production_mode() -> bool:
-    return os.getenv("APP_ENV", "").strip().lower() in {"prod", "production"}
 
 
 def _clamp_int(value: int, lower: int, upper: int) -> int:
@@ -57,29 +54,6 @@ def _normalize_likelihood(raw: float) -> float:
     if raw <= 1:
         return round(float(raw), 3)
     return round(min(raw / (1.0 + raw), 0.999), 3)
-
-def _get_neo4j_driver():
-    """Lazily initialise the Neo4j driver. Returns None if unavailable."""
-    global _NEO4J_DRIVER
-    if _NEO4J_DRIVER is not None:
-        return _NEO4J_DRIVER
-    try:
-        from neo4j import GraphDatabase
-        uri  = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-        user = os.getenv("NEO4J_USER", "neo4j")
-        password = os.getenv("NEO4J_PASSWORD", "").strip()
-        if not password:
-            if _is_production_mode():
-                raise RuntimeError("NEO4J_PASSWORD is required in production mode.")
-            return None
-        _NEO4J_DRIVER = GraphDatabase.driver(uri, auth=(user, password))
-        # Quick connectivity test
-        with _NEO4J_DRIVER.session() as s:
-            s.run("RETURN 1")
-        return _NEO4J_DRIVER
-    except Exception as e:
-        print(f"[tools] Neo4j unavailable ({e}) — KG tools will use JSON fallback.")
-        return None
 
 
 # ── JSON fallback paths (used when Neo4j is down) ─────────────────────────

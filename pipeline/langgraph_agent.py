@@ -789,3 +789,94 @@ def run_agent(
         final_state,
         final_state.get("final_answer", ""),
     )
+
+
+def agent_query(
+    query: str,
+    entity: dict[str, str] | None = None,
+    top_k: int = 15,
+    max_steps: int = 8,
+    require_hitl: bool = False,
+    calling_agent: str = "",
+    context: dict | None = None,
+) -> dict[str, Any]:
+    """
+    Agent-to-agent API endpoint for machine consumption.
+
+    This is the primary interface when another agent needs to fill a knowledge
+    gap about vulnerabilities, correlations, or attack surface analysis.
+
+    Args:
+        query:         The knowledge gap question (e.g., "What co-occurs with CVE-2021-44228?")
+        entity:        Optional entity context {"type": "cve|cwe", "id": "CVE-..."}
+        top_k:         Number of evidence items to retrieve
+        max_steps:     Maximum reasoning steps
+        require_hitl:  Force HITL review regardless of confidence
+        calling_agent: Identifier of the calling agent (for audit trail)
+        context:       Additional context from the calling agent
+
+    Returns:
+        dict with structured response including:
+            - status: "ok" | "needs_human_review" | "error"
+            - entity: resolved entity
+            - direct_evidence: list of confirmed co-occurring vulns
+            - inferred_candidates: list of probable co-occurring vulns
+            - confidence_summary: calibrated confidence with rationale
+            - hitl: human-in-the-loop decision with reasons
+            - recommended_actions: actionable next steps
+            - agent_metadata: inter-agent communication metadata
+    """
+    from pipeline.hitl import evaluate_hitl_policy
+
+    # Run the full agent pipeline
+    raw_json = run_agent(
+        user_query=query,
+        max_steps=max_steps,
+        verbose=False,
+    )
+
+    try:
+        result = json.loads(raw_json)
+    except (json.JSONDecodeError, TypeError):
+        result = {
+            "status": "error",
+            "query": query,
+            "entity": entity or {"type": "unknown", "id": ""},
+            "direct_evidence": [],
+            "inferred_candidates": [],
+            "citations": [],
+            "confidence_summary": {"overall": 0.0, "rationale": "Failed to parse agent output."},
+            "hitl": {"required": True, "reasons": ["Parse failure"]},
+            "recommended_actions": [],
+        }
+
+    # Evaluate HITL policy
+    hitl_decision = evaluate_hitl_policy(result)
+    if require_hitl:
+        hitl_decision["required"] = True
+        if "Caller agent requested mandatory review." not in hitl_decision.get("reasons", []):
+            hitl_decision.setdefault("reasons", []).append("Caller agent requested mandatory review.")
+    result["hitl"] = hitl_decision
+
+    # Add inter-agent metadata
+    result["agent_metadata"] = {
+        "calling_agent": calling_agent or "unknown",
+        "top_k_requested": top_k,
+        "max_steps_used": max_steps,
+        "evidence_counts": {
+            "direct": len(result.get("direct_evidence", [])),
+            "inferred": len(result.get("inferred_candidates", [])),
+            "citations": len(result.get("citations", [])),
+        },
+        "hitl_required": hitl_decision.get("required", False),
+        "confidence": float((result.get("confidence_summary") or {}).get("overall", 0.0)),
+    }
+
+    # Add context from calling agent if provided
+    if context:
+        result["caller_context"] = {
+            k: v for k, v in context.items()
+            if isinstance(k, str) and k not in ("password", "token", "secret", "key")
+        }
+
+    return result

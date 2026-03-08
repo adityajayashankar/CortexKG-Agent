@@ -22,11 +22,14 @@ import os
 import time
 
 # ── Groq models (free tier, generous limits) ──────────────────────────────────
+# NOTE: Only list models currently active on Groq. Decommissioned model IDs
+#       (mixtral-8x7b-32768, gemma2-9b-it) cause 404 errors that exhaust the
+#       fallback chain and silently degrade agent quality.
 GROQ_MODELS = [
     "llama-3.3-70b-versatile",   # best quality on groq
     "llama-3.1-8b-instant",      # fastest, use when 70b is rate limited
-    "mixtral-8x7b-32768",        # good fallback
-    "gemma2-9b-it",              # lightweight fallback
+    "llama3-8b-8192",            # solid general fallback
+    "llama-3.2-11b-text-preview",# newer lightweight option
 ]
 
 # ── OpenRouter free models (secondary) ────────────────────────────────────────

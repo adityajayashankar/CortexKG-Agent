@@ -279,6 +279,70 @@ def pairs_from_nvd_products(nvd_records, max_per_product=20):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Source 5: MITRE ATT&CK technique co-occurrence
+# ─────────────────────────────────────────────────────────────────────────────
+
+MITRE_FILE = DATA_DIR / "raw_mitre_attack.json"
+MAX_ATTACK_CHAIN_PAIRS = int(os.getenv("COOC_MAX_ATTACK_CHAIN_PAIRS", "50000"))
+
+def pairs_from_attack_techniques(max_per_technique=30):
+    """
+    CVEs sharing the same ATT&CK technique form attack_chain co-occurrence pairs.
+    These are high-signal: if two CVEs can be exploited via the same technique,
+    an attacker who uses one likely chains the other.
+    """
+    if not MITRE_FILE.exists():
+        log.info("  ATT&CK data not found — skipping technique co-occurrence")
+        return []
+
+    mitre_data = load_json(MITRE_FILE)
+    cve_to_tech = mitre_data.get("cve_to_techniques", {})
+    techniques = mitre_data.get("techniques", [])
+    tech_by_id = {t["technique_id"]: t for t in techniques if t.get("technique_id")}
+
+    # Invert: technique → [CVEs]
+    tech_to_cves = defaultdict(list)
+    for cve, tids in cve_to_tech.items():
+        for tid in tids:
+            tech_to_cves[tid].append(cve)
+
+    pairs = []
+    seen = set()
+    for tid, cves in sorted(tech_to_cves.items(), key=lambda kv: len(kv[1]), reverse=True):
+        cves = list(set(cves))
+        if len(cves) < 2:
+            continue
+        t = tech_by_id.get(tid, {})
+        tname = t.get("technique_name", tid)
+        tactic = t.get("tactic", "")
+
+        cve_sample = cves[:max_per_technique]
+        for a, b in combinations(cve_sample, 2):
+            key = tuple(sorted([a, b]))
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append({
+                "cve_a": a,
+                "cve_b": b,
+                "source": "attack_chain",
+                "confidence": SOURCE_WEIGHTS["attack_chain"],
+                "reason": (
+                    f"Both CVEs exploitable via ATT&CK technique {tid} ({tname})"
+                    + (f" in {tactic} phase" if tactic else "")
+                ),
+                "technique": tid,
+            })
+            if len(pairs) >= MAX_ATTACK_CHAIN_PAIRS:
+                log.info(f"  ATT&CK technique pairs capped at {MAX_ATTACK_CHAIN_PAIRS:,}")
+                log.info(f"  ATT&CK technique co-occurrence pairs: {len(pairs):,}")
+                return pairs
+
+    log.info(f"  ATT&CK technique co-occurrence pairs: {len(pairs):,}")
+    return pairs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Merge + aggregate confidence across sources
 # ─────────────────────────────────────────────────────────────────────────────
 # Old behavior: keep only highest-confidence per pair → discards multi-source
@@ -383,8 +447,9 @@ def main():
     cwe_pairs     = pairs_from_cwe_chains(cwe_data)
     kev_pairs     = pairs_from_kev_clusters(kev_data)
     product_pairs = pairs_from_nvd_products(nvd_records)
+    attack_pairs  = pairs_from_attack_techniques()
 
-    all_pairs     = merge_pairs(stack_pairs, cwe_pairs, kev_pairs, product_pairs)
+    all_pairs     = merge_pairs(stack_pairs, cwe_pairs, kev_pairs, product_pairs, attack_pairs)
     neg_registry  = build_negative_registry()
 
     # Source breakdown
@@ -405,6 +470,7 @@ def main():
             "kev_pairs":           len(kev_pairs),
             "stack_pairs":         len(stack_pairs),
             "product_pairs":       len(product_pairs),
+            "attack_chain_pairs":  len(attack_pairs),
         },
     }
 
