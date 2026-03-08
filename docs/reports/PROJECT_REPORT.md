@@ -91,7 +91,7 @@ graph TB
     subgraph DataPipeline["Phase 1 — Data Pipeline"]
         CRAWL[Crawlers<br/>data/crawl_*.py]
         CORR[Correlation Builder<br/>build_correlations.py]
-        COOC[Co-occurrence Builder v2<br/>build_cooccurrence_v2.py]
+        COOC[Co-occurrence Builder v2<br/>scripts/dataset/build_cooccurrence_v2.py]
         KEV_CLUST[KEV Campaign Clusterer<br/>cluster_kev_campaigns.py]
         OWASP[OWASP Mapper<br/>owasp_mapper.py]
         DS[Dataset Builder<br/>build_dataset.py]
@@ -222,7 +222,7 @@ flowchart LR
 
     subgraph Phase2["Phase 2: Correlate"]
         R1 & R2 & R3 & R4 & R5 --> CORR2[build_correlations.py\n5.8M links]
-        R1 & R3 --> COOC2[build_cooccurrence_v2.py\n891k pairs]
+        R1 & R3 --> COOC2[scripts/dataset/build_cooccurrence_v2.py\n891k pairs]
         COLLECT_CWE[collect_cwe_chains.py] --> CHAINS[raw_cwe_chains.json]
         CLUSTER[cluster_kev_campaigns.py] --> KEVCLUST[raw_kev_clusters.json\n160k]
     end
@@ -232,17 +232,17 @@ flowchart LR
         COOC2 --> BUILD
         CHAINS --> BUILD
         BUILD --> VULN[vuln_dataset.jsonl\n325k rows]
-        BUILD --> STACK[stack_profiles.py → raw_cooccurrence_v2]
+        BUILD --> STACK[scripts/dataset/stack_profiles.py → raw_cooccurrence_v2]
         VULN --> EXPAND[expand_training_pairs.py]
         EXPAND --> TP[training_pairs.jsonl\n2.6M pairs]
-        SYNTH[generate_synthetic_pairs.py] --> TP
-        COOC_PAIRS[generate_cooccurrence_pairs.py] --> TP
+        SYNTH[scripts/dataset/generate_synthetic_pairs.py] --> TP
+        COOC_PAIRS[scripts/dataset/generate_cooccurrence_pairs.py] --> TP
     end
 
     subgraph Phase4["Phase 4: Master Build + KG Load"]
         VULN & CORR2 & COOC2 --> MASTER2[build_master_dataset.py]
         MASTER2 --> MASTERF[master_vuln_context.jsonl]
-        MASTERF --> KGLOAD[load_kg_master.py]
+        MASTERF --> KGLOAD[scripts/kg/load_kg_master.py]
         KGLOAD --> NEO4J2[(Neo4j KG)]
     end
 
@@ -393,7 +393,7 @@ Uses Groq LLM to generate search queries → Tavily finds URLs → crawl4ai down
 - Minimum correlation score threshold: ≥0.60
 - Output: 328k rows, 5.8M total links
 
-**`build_cooccurrence_v2.py`** — builds `raw_cooccurrence_v2.json`:
+**`scripts/dataset/build_cooccurrence_v2.py`** — builds `raw_cooccurrence_v2.json`:
 - 8 co-occurrence signal types:
 
 | Signal Type | Count | Meaning |
@@ -409,7 +409,7 @@ Uses Groq LLM to generate search queries → Tavily finds URLs → crawl4ai down
 
 **`cluster_kev_campaigns.py`** — groups KEV entries by temporal proximity and vendor overlap into 160k campaign cluster entries with 63 negative inference rules (pairs that look similar but are NOT related).
 
-**`stack_profiles.py`** — builds 22,192 stack profiles (technology fingerprints) used as co-occurrence signals.
+**`scripts/dataset/stack_profiles.py`** — builds 22,192 stack profiles (technology fingerprints) used as co-occurrence signals.
 
 **`collect_cwe_chains.py`** — maps CWE parent-child and can-precede relationships, feeding `HAS_CWE` and `CONTAINS_CWE` graph edges.
 
@@ -645,17 +645,17 @@ Express.js server exposing Neo4j through REST with:
 
 ### 4.13 Validation
 
-**`validate_dataset.py`** — dataset quality checker:
+**`scripts/analysis/validate_dataset.py`** — dataset quality checker:
 - Token length distribution (with/without tokenizer)
 - Duplicate detection and optional deduplication (`--fix`)
 - Short-output detection (drops examples <80 chars)
 - Layer coverage analysis
 
-**`data/validate_dataset.py`** — deep vuln_dataset checks:
+**`scripts/analysis/validate_dataset.py`** — deep vuln_dataset checks:
 - CVSS/EPSS/CWE/software coverage percentages
 - Expected count thresholds per layer
 
-**KG validation** (Cypher queries defined in `KG_VALIDATION_CHECKLIST.md`):
+**KG validation** (Cypher queries defined in `docs/kg/KG_VALIDATION_CHECKLIST.md`):
 - Schema + volume sanity (labels, relationship types, constraint existence)
 - Null/duplicate node IDs
 - Self-loop detection
@@ -890,13 +890,13 @@ The deterministic HITL escalation ensures the agent **never silently returns low
 python run_pipeline.py
 
 # 3. Validate dataset
-python validate_dataset.py --no-tokenizer
+python scripts/analysis/validate_dataset.py --no-tokenizer
 
 # 4. Build master dataset
 python data/build_master_dataset.py
 
 # 5. Load Neo4j KG
-python load_kg_master.py
+python scripts/kg/load_kg_master.py
 
 # 6. Start vector ingest
 python scripts/maintenance/graphrag_embed_index_qdrant_cpu.py --max-vectors 225000 --batch-size 64 --qdrant-batch-size 256

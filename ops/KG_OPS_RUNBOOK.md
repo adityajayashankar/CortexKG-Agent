@@ -18,7 +18,7 @@ $release = "kg_$(Get-Date -Format 'yyyyMMdd_HHmm')"
 python data/build_master_dataset.py --output data/master_vuln_context_$release.jsonl
 
 # 2) Load KG (single-file path)
-python load_kg_master.py --master-file data/master_vuln_context_$release.jsonl
+python scripts/kg/load_kg_master.py --master-file data/master_vuln_context_$release.jsonl
 
 # 3) KG validation gate
 python scripts/maintenance/validate_kg.py --strict --sample-cves 50 --seed 42 --output-json eval/results/kg_validation_$release.json --output-md eval/results/kg_validation_$release.md
