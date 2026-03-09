@@ -1156,7 +1156,7 @@ def to_kev_correlation_pairs(record: dict) -> list:
             f"KEV-listed vulnerabilities in the {owasp_short} category are typically exploited "
             f"as part of multi-stage attack chains, not in isolation."
             + co_lines
-            + "\n\nPriority action: Patch {cve_id} immediately. Simultaneously assess the "
+            + f"\n\nPriority action: Patch {cve_id} immediately. Simultaneously assess the "
             f"co-occurrence surface above — adversaries who exploited {cve_id} have "
             f"demonstrated the capability and intent to exploit these related categories."
         ),

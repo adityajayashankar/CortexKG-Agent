@@ -105,23 +105,16 @@ def _get_neo4j_driver():
         from pipeline.neo4j_conn import get_neo4j_driver
         return get_neo4j_driver()
     except ImportError:
-        # Fallback for isolated script execution
-        try:
-            from neo4j import GraphDatabase
-        except Exception:
-            return None
-        uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-        user = os.getenv("NEO4J_USER", "neo4j")
-        password = os.getenv("NEO4J_PASSWORD", "").strip()
-        if not password:
-            return None
-        try:
-            driver = GraphDatabase.driver(uri, auth=(user, password))
-            with driver.session() as s:
-                s.run("RETURN 1")
-            return driver
-        except Exception:
-            return None
+        return None
+
+
+def _reconnect_neo4j_driver():
+    """Reset stale driver and reconnect via the shared singleton."""
+    try:
+        from pipeline.neo4j_conn import reset_driver
+        return reset_driver()
+    except ImportError:
+        return None
 
 
 def _query_cve_neighbors(session, cve_id: str, top_k: int) -> list[dict[str, Any]]:
@@ -132,7 +125,7 @@ def _query_cve_neighbors(session, cve_id: str, top_k: int) -> list[dict[str, Any
         RETURN related.vuln_id AS cve_id,
                coalesce(r.max_score, r.max_confidence, 0.0) AS score,
                type(r) AS rel_type,
-               coalesce(r.signals, []) AS signals,
+               coalesce(r.signals, r.sources, []) AS signals,
                coalesce(r.reasons, []) AS reasons
         ORDER BY score DESC
         LIMIT $top_k
@@ -150,7 +143,7 @@ def _query_cve_neighbors_by_type(session, cve_id: str, rel_type: str, top_k: int
         RETURN related.vuln_id AS cve_id,
                coalesce(r.max_score, r.max_confidence, 0.0) AS score,
                type(r) AS rel_type,
-               coalesce(r.signals, []) AS signals,
+               coalesce(r.signals, r.sources, []) AS signals,
                coalesce(r.reasons, []) AS reasons
         ORDER BY score DESC
         LIMIT $top_k
@@ -180,25 +173,18 @@ def _mix_cve_neighbors(
     target_cooc = min(max(min_cooccur, 0), top_k)
     selected = cooc_rows[:target_cooc] + corr_rows[: max(0, top_k - min(len(cooc_rows), target_cooc))]
 
-    seen: set[str] = set()
-    deduped: list[dict[str, Any]] = []
-    for row in selected:
+    # Merge all rows keeping the highest-score edge for each CVE,
+    # so a CVE with both CORR and COOC edges always shows its stronger signal.
+    best: dict[str, dict[str, Any]] = {}
+    for row in selected + corr_rows + cooc_rows:
         key = str(row.get("cve_id", "")).upper().strip()
-        if not key or key in seen:
+        if not key:
             continue
-        seen.add(key)
-        deduped.append(row)
+        prev = best.get(key)
+        if prev is None or float(row.get("score", 0.0)) > float(prev.get("score", 0.0)):
+            best[key] = row
 
-    if len(deduped) < top_k:
-        remainder = sorted(corr_rows + cooc_rows, key=lambda x: float(x.get("score", 0.0)), reverse=True)
-        for row in remainder:
-            key = str(row.get("cve_id", "")).upper().strip()
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            deduped.append(row)
-            if len(deduped) >= top_k:
-                break
+    deduped = sorted(best.values(), key=lambda x: float(x.get("score", 0.0)), reverse=True)
     return deduped[:top_k]
 
 
@@ -267,81 +253,91 @@ def _graph_candidates(entity: GraphEntity, top_k: int, max_hops: int = 2) -> lis
         return []
 
     rows: list[dict[str, Any]] = []
-    try:
-        with driver.session() as session:
-            if entity.type == "cve" and entity.id:
-                min_cooccur = max(0, min(int(os.getenv("GRAPHRAG_MIN_COOCCUR_PER_CVE", "2")), top_k))
-                hop1 = _mix_cve_neighbors(session, entity.id, top_k=top_k, min_cooccur=min_cooccur)
-                for row in hop1:
-                    row["hop"] = 1
-                    row["source_type"] = "graph"
-                rows.extend(hop1)
+    for _attempt in range(2):  # retry once on stale-connection errors
+        try:
+            with driver.session() as session:
+                if entity.type == "cve" and entity.id:
+                    min_cooccur = max(0, min(int(os.getenv("GRAPHRAG_MIN_COOCCUR_PER_CVE", "2")), top_k))
+                    hop1 = _mix_cve_neighbors(session, entity.id, top_k=top_k, min_cooccur=min_cooccur)
+                    for row in hop1:
+                        row["hop"] = 1
+                        row["source_type"] = "graph"
+                    rows.extend(hop1)
 
-                if max_hops >= 2 and hop1:
-                    branch_factor = min(max(3, top_k // 2), 8)
-                    seeds = [str(r.get("cve_id", "")).upper().strip() for r in hop1[:branch_factor]]
-                    seed_neighbors_map: dict[str, list[dict[str, Any]]] = {}
-                    for seed in seeds:
-                        if not seed:
-                            continue
-                        seed_neighbors_map[seed] = _query_cve_neighbors(
-                            session,
-                            seed,
-                            top_k=max(top_k, branch_factor * 3),
+                    if max_hops >= 2 and hop1:
+                        branch_factor = min(max(3, top_k // 2), 8)
+                        seeds = [str(r.get("cve_id", "")).upper().strip() for r in hop1[:branch_factor]]
+                        seed_neighbors_map: dict[str, list[dict[str, Any]]] = {}
+                        for seed in seeds:
+                            if not seed:
+                                continue
+                            seed_neighbors_map[seed] = _query_cve_neighbors(
+                                session,
+                                seed,
+                                top_k=max(top_k, branch_factor * 3),
+                            )
+                        rows.extend(
+                            _compute_second_hop_from_seed_map(
+                                origin_marker=entity.id,
+                                hop1_rows=hop1,
+                                seed_neighbors_map=seed_neighbors_map,
+                                top_k=top_k,
+                            )
                         )
-                    rows.extend(
-                        _compute_second_hop_from_seed_map(
-                            origin_marker=entity.id,
-                            hop1_rows=hop1,
-                            seed_neighbors_map=seed_neighbors_map,
-                            top_k=top_k,
-                        )
-                    )
-            elif entity.type == "cwe" and entity.id:
-                hop1 = session.run(
-                    """
-                    MATCH (w:CWE {cwe_id: $cwe_id})<-[:HAS_CWE]-(v:Vulnerability)
-                    OPTIONAL MATCH (v)-[r:CORRELATED_WITH|CO_OCCURS_WITH]-(peer:Vulnerability)
-                    RETURN coalesce(peer.vuln_id, v.vuln_id) AS cve_id,
-                           coalesce(r.max_score, r.max_confidence, v.epss_score, 0.2) AS score,
-                           coalesce(type(r), 'HAS_CWE') AS rel_type,
-                           CASE WHEN r IS NULL THEN ['shared_cwe:' + $cwe_id] ELSE coalesce(r.signals, []) END AS signals,
-                           coalesce(r.reasons, []) AS reasons
-                    ORDER BY score DESC
-                    LIMIT $top_k
-                    """,
-                    cwe_id=entity.id,
-                    top_k=top_k,
-                ).data()
-                for row in hop1:
-                    row["hop"] = 1
-                    row["source_type"] = "graph"
-                rows.extend(hop1)
+                elif entity.type == "cwe" and entity.id:
+                    hop1 = session.run(
+                        """
+                        MATCH (w:CWE {cwe_id: $cwe_id})<-[:HAS_CWE]-(v:Vulnerability)
+                        OPTIONAL MATCH (v)-[r:CORRELATED_WITH|CO_OCCURS_WITH]-(peer:Vulnerability)
+                        RETURN coalesce(peer.vuln_id, v.vuln_id) AS cve_id,
+                               coalesce(r.max_score, r.max_confidence, v.epss_score, 0.2) AS score,
+                               coalesce(type(r), 'HAS_CWE') AS rel_type,
+                               CASE WHEN r IS NULL THEN ['shared_cwe:' + $cwe_id] ELSE coalesce(r.signals, r.sources, []) END AS signals,
+                               coalesce(r.reasons, []) AS reasons
+                        ORDER BY score DESC
+                        LIMIT $top_k
+                        """,
+                        cwe_id=entity.id,
+                        top_k=top_k,
+                    ).data()
+                    for row in hop1:
+                        row["hop"] = 1
+                        row["source_type"] = "graph"
+                    rows.extend(hop1)
 
-                if max_hops >= 2 and hop1:
-                    branch_factor = min(max(3, top_k // 2), 8)
-                    seeds = [str(r.get("cve_id", "")).upper().strip() for r in hop1[:branch_factor]]
-                    seed_neighbors_map: dict[str, list[dict[str, Any]]] = {}
-                    for seed in seeds:
-                        if not seed:
-                            continue
-                        seed_neighbors_map[seed] = _query_cve_neighbors(
-                            session,
-                            seed,
-                            top_k=max(top_k, branch_factor * 3),
+                    if max_hops >= 2 and hop1:
+                        branch_factor = min(max(3, top_k // 2), 8)
+                        seeds = [str(r.get("cve_id", "")).upper().strip() for r in hop1[:branch_factor]]
+                        seed_neighbors_map: dict[str, list[dict[str, Any]]] = {}
+                        for seed in seeds:
+                            if not seed:
+                                continue
+                            seed_neighbors_map[seed] = _query_cve_neighbors(
+                                session,
+                                seed,
+                                top_k=max(top_k, branch_factor * 3),
+                            )
+                        rows.extend(
+                            _compute_second_hop_from_seed_map(
+                                origin_marker=entity.id,
+                                hop1_rows=hop1,
+                                seed_neighbors_map=seed_neighbors_map,
+                                top_k=top_k,
+                            )
                         )
-                    rows.extend(
-                        _compute_second_hop_from_seed_map(
-                            origin_marker=entity.id,
-                            hop1_rows=hop1,
-                            seed_neighbors_map=seed_neighbors_map,
-                            top_k=top_k,
-                        )
-                    )
-    except Exception:
-        rows = []
-    finally:
-        driver.close()
+            break  # success — exit retry loop
+        except Exception as e:
+            err_str = str(e).lower()
+            if _attempt == 0 and ("closed" in err_str or "connection" in err_str or "unavailable" in err_str):
+                print(f"[retriever] Neo4j session error (attempt {_attempt+1}): {e} — reconnecting...")
+                driver = _reconnect_neo4j_driver()
+                if not driver:
+                    break
+                rows = []  # reset before retry
+            else:
+                print(f"[retriever] Neo4j query failed: {e}")
+                rows = []
+                break
     return rows
 
 
@@ -577,7 +573,7 @@ def retrieve_hybrid(
     max_hops: int = 2,
     use_vector: bool = True,
 ) -> dict[str, Any]:
-    top_k = max(1, min(int(top_k), 25))
+    top_k = max(1, min(int(top_k), 70))  # hard cap to control latency/noise
     max_hops = max(1, min(int(max_hops), 3))
     ent = _normalize_entity(query, entity)
 
