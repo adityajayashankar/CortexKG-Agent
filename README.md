@@ -1,6 +1,6 @@
 # Vulnerability GraphRAG Agent
 Pipeline
-Complete run order from scratch on Windows PowerShell. Covers data collection, KG build, vector indexing, agent runtime, and optional fine-tuning.
+Complete run order from scratch on Windows PowerShell. Covers data collection, KG build, vector indexing, and agent runtime.
 
 ## Architecture Overview
 
@@ -13,9 +13,8 @@ Data Sources (10+)                  Neo4j Knowledge Graph
   Closed sources / ExploitDB                        │
               │                                     ▼
               ▼                       Qdrant Vector Index (bge-small-en-v1.5)
-  vuln_dataset.jsonl (325k CVEs)       vuln_kg_evidence_v1 (225k vectors)
-  training_pairs.jsonl (2.6M pairs)              │
-              │                                  ▼
+  master_vuln_context.jsonl            vuln_kg_evidence_v1 (planned 1M-2M chunks)
+              │                                     │
               └──────────────► LangGraph Agent (main.py)
                                 multi-hop hybrid GraphRAG + HITL policy
 ```
@@ -34,8 +33,6 @@ Data Sources (10+)                  Neo4j Knowledge Graph
 | `scripts/maintenance/graphrag_upsert_cache.py` | Phase 2 of two-phase ingest: upsert cached vectors to Qdrant |
 | `eval/run_graphrag_benchmark.py` | Held-out retrieval quality benchmark |
 | `main.py` | Interactive agent CLI |
-| `training/finetuning.py` | Fine-tune Foundation-Sec-8B (QLoRA, phase 1) |
-| `training/finetuning_phase2.py` | Fine-tune continuation (phase 2) |
 
 ---
 
@@ -98,9 +95,9 @@ $env:AGENT_GRAPHRAG_USE_VECTOR="0"
 
 ---
 
-## Phase 1 — Data Collection & Dataset Build
+## Phase 1 — Data Collection & Graph Inputs
 
-This phase crawls all sources, builds correlation/co-occurrence graphs, produces `vuln_dataset.jsonl` and `training_pairs.jsonl`.
+This phase crawls all sources, builds correlation/co-occurrence graphs, and produces graph input artifacts.
 
 ### 1a) Full pipeline (collect → correlate → build → validate)
 
@@ -108,7 +105,7 @@ This phase crawls all sources, builds correlation/co-occurrence graphs, produces
 python run_pipeline.py
 ```
 
-**Pipeline stages run in order:**
+**Graph-relevant pipeline stages (in order):**
 
 | # | Stage | Key output |
 |---|-------|-----------|
@@ -126,9 +123,7 @@ python run_pipeline.py
 | 12 | Collect CWE chains | `data/raw_cwe_chains.json` |
 | 13 | Cluster KEV campaigns | `data/raw_kev_clusters.json` |
 | 14 | Build co-occurrence v2 | `data/raw_cooccurrence_v2.json` |
-| 15 | Build dataset + pairs | `data/vuln_dataset.jsonl`, `data/training_pairs.jsonl` |
-| 16 | Generate co-occurrence pairs | appended to `data/training_pairs.jsonl` |
-| 17 | Generate synthetic pairs | appended to `data/training_pairs.jsonl` |
+| 15 | Build core vulnerability dataset | `data/vuln_dataset.jsonl` |
 | 18 | Validate dataset | quality report to stdout |
 
 **Useful flags:**
@@ -188,6 +183,7 @@ python scripts/maintenance/run_both_scripts.py
 ## Phase 2 — Build Master Dataset
 
 Joins all raw artifacts into a single enriched JSONL used by the KG loader and Qdrant indexer.
+This is the canonical final dataset for graph runtime.
 
 ```powershell
 python data/build_master_dataset.py
@@ -233,6 +229,8 @@ Expected graph after load:
 | CORRELATED_WITH edges | ~5.12M |
 | CO_OCCURS_WITH edges | ~891k |
 | Total relationships | ~6.9M |
+| Canonical final dataset | `data/master_vuln_context.jsonl` |
+| Planned vector chunks to store | `1,000,000 - 2,000,000` |
 
 ---
 
@@ -281,7 +279,8 @@ eval/results/graphrag_eval.csv
 ## Phase 5 — Vector Indexing (Qdrant)
 
 The embedding model is `BAAI/bge-small-en-v1.5` (384-dim, CPU-optimized).
-Observed throughput: ~15.6 vectors/sec on CPU → full 225k ingest ≈ 4 hours.
+Observed throughput: ~15.6 vectors/sec on CPU.
+Planned storage target: `1,000,000 - 2,000,000` chunks (`~18 - 36` hours on CPU at current throughput).
 
 ### 5a) Verify Qdrant connectivity
 
@@ -300,18 +299,25 @@ python scripts/maintenance/graphrag_embed_index_qdrant_cpu.py `
   --max-vectors 2000 --batch-size 64 --qdrant-batch-size 256
 ```
 
-### 5c) Full ingest (225k vectors, streaming)
+### 5c) Planned ingest target (1M chunks, streaming)
 
 ```powershell
 python scripts/maintenance/graphrag_embed_index_qdrant_cpu.py `
-  --max-vectors 225000 --batch-size 64 --qdrant-batch-size 256
+  --max-vectors 1000000 --batch-size 64 --qdrant-batch-size 256
+```
+
+Optional larger target (2M chunks):
+
+```powershell
+python scripts/maintenance/graphrag_embed_index_qdrant_cpu.py `
+  --max-vectors 2000000 --batch-size 64 --qdrant-batch-size 256
 ```
 
 ### 5d) Resume if interrupted
 
 ```powershell
 python scripts/maintenance/graphrag_embed_index_qdrant_cpu.py `
-  --resume-from <done_count> --max-vectors 225000 --batch-size 64 --qdrant-batch-size 256
+  --resume-from <done_count> --max-vectors <1000000_or_2000000> --batch-size 64 --qdrant-batch-size 256
 ```
 
 ### 5e) Alternative two-phase ingest (embed locally, then upsert)
@@ -362,41 +368,6 @@ $env:AGENT_GRAPHRAG_TOP_K="20"      # number of graph+vector candidates
 $env:AGENT_GRAPHRAG_MAX_HOPS="2"    # graph traversal depth
 $env:AGENT_GRAPHRAG_USE_VECTOR="1"  # enable vector retrieval (after ingest)
 ```
-
----
-
-## Phase 7 — Fine-Tuning (Optional)
-
-Fine-tunes `fdtn-ai/Foundation-Sec-8B` (Llama 3.1-based, 80B cyber token pre-training) using QLoRA on the generated `training_pairs.jsonl`.
-
-Recommended hardware: A100 40 GB (fits with 4-bit QLoRA at `max_length=4096`).
-On 2× T4: set `max_length=2048` and `gradient_accumulation_steps=32`.
-
-### Phase 1 — Base SFT
-
-```powershell
-python training/finetuning.py
-```
-
-Key config (in `finetuning.py`): LoRA r=32 / alpha=64, `vulnerability_correlation` and `vulnerability_cooccurrence` layers sampled at 3×.
-
-### Phase 2 — Continuation
-
-```powershell
-python training/finetuning_phase2.py
-```
-
----
-
-## Optional — Augmented Training Dataset
-
-Generates a 1 GB augmented dataset with 5 scenario-based semantic reframings per base pair (incident response, red team, compliance, threat hunting, vuln management):
-
-```powershell
-python data/expand_training_pairs.py --target-total-mb 1024
-```
-
-Output: `data/training_pairs_augmented_1gb.jsonl`
 
 ---
 

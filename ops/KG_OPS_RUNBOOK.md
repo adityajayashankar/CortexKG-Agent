@@ -1,5 +1,27 @@
 # KG Ops Runbook
 
+## Current State (as of March 9, 2026)
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Neo4j KG | ✅ Loaded | 407,713 nodes / 6,928,186 relationships |
+| Qdrant vector index | ⚠️ Partial | 20,038 / 1,000,000–2,000,000 target vectors ingested |
+| Benchmark (`run_graphrag_benchmark.py`) | ❌ Blocked | All 120 probes error with `No module named 'pipeline'` — run from project root with `PYTHONPATH=.` |
+| Ground-truth benchmark | ❌ Blocked | Same import error; 20/20 probes fail |
+| training_pairs.jsonl | ✅ Current | 3,509,451 rows / 3.17 GB |
+| vuln_dataset.jsonl | ✅ Current | 325,941 rows / 1.34 GB |
+| Fine-tuned model | 🔲 Pending | Training not yet run |
+| Releases manifest | 🔲 Empty | No promoted releases yet |
+
+**Benchmark fix:** Run the benchmark from the project root so that `pipeline` is importable:
+```powershell
+cd C:\Users\adity\dataset-deplai
+$env:PYTHONPATH="."
+python eval/run_graphrag_benchmark.py --benchmark-file eval/heldout_cve_benchmark.jsonl --ground-truth eval/ground_truth_benchmark.jsonl --max-probes 120 --top-k 20 --max-hops 2 --strict --output-json eval/results/graphrag_eval.json --output-csv eval/results/graphrag_eval.csv
+```
+
+---
+
 ## Release Model
 - Cadence: on-demand manual.
 - Release id format: `kg_YYYYMMDD_HHMM`.
