@@ -1,5 +1,5 @@
-# Vulnerability GraphRAG Pipeline (Qdrant + Neo4j)
-
+# Vulnerability GraphRAG Agent
+Pipeline
 Complete run order from scratch on Windows PowerShell. Covers data collection, KG build, vector indexing, agent runtime, and optional fine-tuning.
 
 ## Architecture Overview
@@ -26,8 +26,8 @@ Data Sources (10+)                  Neo4j Knowledge Graph
 |--------|---------|
 | `run_pipeline.py` | Master orchestrator — collect → correlate → build → validate |
 | `data/build_master_dataset.py` | Join all raw artifacts into one `master_vuln_context.jsonl` |
-| `load_kg_master.py` | Load Neo4j KG from master JSONL (preferred) |
-| `load_kg.py` | Legacy multi-file Neo4j loader |
+| `scripts/kg/load_kg_master.py` | Load Neo4j KG from master JSONL (preferred) |
+| `scripts/kg/load_kg.py` | Legacy multi-file Neo4j loader |
 | `scripts/maintenance/validate_kg.py` | Automated KG integrity + source-alignment checks |
 | `scripts/maintenance/graphrag_embed_index_qdrant_cpu.py` | CPU-optimized streaming embed + upsert to Qdrant |
 | `scripts/maintenance/graphrag_embed_local.py` | Phase 1 of two-phase ingest: embed to local JSONL cache |
@@ -156,25 +156,25 @@ python run_pipeline.py --dry-run
 ### 1b) Validate dataset quality (recommended)
 
 ```powershell
-python validate_dataset.py
+python scripts/analysis/validate_dataset.py
 ```
 
 Optional — fast heuristic mode without loading the tokenizer:
 
 ```powershell
-python validate_dataset.py --no-tokenizer
+python scripts/analysis/validate_dataset.py --no-tokenizer
 ```
 
 Auto-fix bad examples (drop outputs <80 chars, dedup):
 
 ```powershell
-python validate_dataset.py --fix
+python scripts/analysis/validate_dataset.py --fix
 ```
 
 ### 1c) Dataset statistics
 
 ```powershell
-python analyze_dataset.py
+python scripts/analysis/analyze_dataset.py
 ```
 
 Or run both together:
@@ -215,13 +215,13 @@ python data/build_master_dataset.py --max-source-items 50000
 **Preferred — single master file:**
 
 ```powershell
-python load_kg_master.py --master-file data/master_vuln_context.jsonl
+python scripts/kg/load_kg_master.py --master-file data/master_vuln_context.jsonl
 ```
 
 **Legacy — multi-file loader:**
 
 ```powershell
-python load_kg.py
+python scripts/kg/load_kg.py
 ```
 
 Expected graph after load:
