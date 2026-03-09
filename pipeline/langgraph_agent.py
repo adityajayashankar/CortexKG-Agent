@@ -114,7 +114,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw not in {"0", "false", "no"}
 
 
-AGENT_GRAPHRAG_TOP_K = _env_int("AGENT_GRAPHRAG_TOP_K", 20, 1, 25)
+AGENT_GRAPHRAG_TOP_K = _env_int("AGENT_GRAPHRAG_TOP_K", 100, 1, 100)
 AGENT_GRAPHRAG_MAX_HOPS = _env_int("AGENT_GRAPHRAG_MAX_HOPS", 2, 1, 3)
 AGENT_GRAPHRAG_USE_VECTOR = _env_bool("AGENT_GRAPHRAG_USE_VECTOR", default=False)
 
@@ -609,17 +609,23 @@ def _planner_node(state: AgentState) -> AgentState:
         )
         response = f"ACTION: graphrag_query({forced_arg})"
     else:
-        response = ask_model(
-            instruction=(
-                "Based on the conversation so far, decide the next step. "
-                "Call a tool using ACTION: tool_name(argument) "
-                "or provide your complete FINAL JSON contract."
-            ),
-            context=context,
-            layer="general",
-        )
-        if _is_model_error(response) and state.get("tool_results"):
-            response = f"FINAL: {_fallback_report_from_tools(state)}"
+        # If graphrag already ran and returned a valid contract, skip the LLM
+        # synthesis call entirely — just emit FINAL directly.
+        graphrag_result = _extract_tool_json(state.get("tool_results", []), "graphrag_query")
+        if isinstance(graphrag_result, dict) and _looks_like_contract(graphrag_result):
+            response = f"FINAL: {json.dumps(graphrag_result)}"
+        else:
+            response = ask_model(
+                instruction=(
+                    "Based on the conversation so far, decide the next step. "
+                    "Call a tool using ACTION: tool_name(argument) "
+                    "or provide your complete FINAL JSON contract."
+                ),
+                context=context,
+                layer="general",
+            )
+            if _is_model_error(response) and state.get("tool_results"):
+                response = f"FINAL: {_fallback_report_from_tools(state)}"
 
     if state["verbose"]:
         preview = response[:250] + ("..." if len(response) > 250 else "")

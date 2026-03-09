@@ -28,15 +28,15 @@ import time
 GROQ_MODELS = [
     "llama-3.3-70b-versatile",   # best quality on groq
     "llama-3.1-8b-instant",      # fastest, use when 70b is rate limited
-    "llama3-8b-8192",            # solid general fallback
-    "llama-3.2-11b-text-preview",# newer lightweight option
+    # Slots 3/4: check https://console.groq.com/docs/models for currently active IDs.
+    # "gemma2-9b-it" and "llama-3.2-3b-preview" are decommissioned as of 2026.
 ]
 
 # ── OpenRouter free models (secondary) ────────────────────────────────────────
 OPENROUTER_MODELS = [
     "meta-llama/llama-3.3-70b-instruct:free",
-    "google/gemma-3-27b-it:free",
-    "mistralai/mistral-7b-instruct:free",
+    "mistralai/mistral-7b-instruct:free",         # moved up: gemma-3-27b-it rejects system prompts
+    "meta-llama/llama-3.2-3b-instruct:free",      # lightweight fallback
 ]
 
 # ── Ollama local models (tertiary, zero rate limits) ──────────────────────────

@@ -47,25 +47,30 @@ MAX_COOC_ROWS = int(os.getenv("GRAPHRAG_MAX_COOC_ROWS", "0"))
 MAX_TOTAL_CHUNKS = int(os.getenv("GRAPHRAG_MAX_TOTAL_CHUNKS", "0"))
 LOG_EVERY = int(os.getenv("GRAPHRAG_LOG_EVERY", "20000"))
 JSONL_LOG_EVERY = int(os.getenv("GRAPHRAG_JSONL_LOG_EVERY", "5000"))
-ENABLE_CORR = os.getenv("GRAPHRAG_ENABLE_CORR", "1").strip().lower() not in {"0", "false", "no"}
-ENABLE_COOC = os.getenv("GRAPHRAG_ENABLE_COOC", "1").strip().lower() not in {"0", "false", "no"}
-ENABLE_DATASET = os.getenv("GRAPHRAG_ENABLE_DATASET", "1").strip().lower() not in {"0", "false", "no"}
-ENABLE_KG_EDGE_CHUNKS = os.getenv("GRAPHRAG_ENABLE_KG_EDGE_CHUNKS", "0").strip().lower() not in {
+ENABLE_CORR = os.getenv("GRAPHRAG_ENABLE_CORR", "0").strip().lower() not in {"0", "false", "no"}
+ENABLE_COOC = os.getenv("GRAPHRAG_ENABLE_COOC", "0").strip().lower() not in {"0", "false", "no"}
+ENABLE_DATASET = os.getenv("GRAPHRAG_ENABLE_DATASET", "0").strip().lower() not in {"0", "false", "no"}
+ENABLE_KG_EDGE_CHUNKS = os.getenv("GRAPHRAG_ENABLE_KG_EDGE_CHUNKS", "1").strip().lower() not in {
     "0",
     "false",
     "no",
 }
 
 MAX_REL_PER_CVE = int(os.getenv("GRAPHRAG_MAX_REL_PER_CVE", "4"))
+KG_EDGE_PAGE_SIZE = max(1, int(os.getenv("GRAPHRAG_KG_PAGE_SIZE", "5000")))
 try:
     MIN_CORR_SCORE = float(os.getenv("GRAPHRAG_MIN_CORR_SCORE", "0.60"))
 except Exception:
     MIN_CORR_SCORE = 0.60
 
-DATASET_QUOTA = int(os.getenv("GRAPHRAG_DATASET_QUOTA", "150000"))
-COOC_QUOTA = int(os.getenv("GRAPHRAG_COOC_QUOTA", "100000"))
-CORR_QUOTA = int(os.getenv("GRAPHRAG_CORR_QUOTA", "50000"))
+DATASET_QUOTA = int(os.getenv("GRAPHRAG_DATASET_QUOTA", "0"))
+COOC_QUOTA = int(os.getenv("GRAPHRAG_COOC_QUOTA", "0"))
+CORR_QUOTA = int(os.getenv("GRAPHRAG_CORR_QUOTA", "0"))
 DATASET_GROUP_SIZE = max(1, int(os.getenv("GRAPHRAG_DATASET_GROUP_SIZE", "10")))
+try:
+    MIN_COOC_CONFIDENCE = float(os.getenv("GRAPHRAG_MIN_COOC_CONFIDENCE", "0.60"))
+except Exception:
+    MIN_COOC_CONFIDENCE = 0.60
 
 QDRANT_TEXT_FIELD = (
     os.getenv("QDRANT_TEXT_FIELD", "chunk_text").strip() or "chunk_text"
@@ -255,37 +260,61 @@ def _read_jsonl_limited(path: Path, max_rows: int = 0) -> list[dict[str, Any]]:
     return rows
 
 
-def _kg_edges() -> list[dict[str, Any]]:
+def _kg_edges() -> Iterator[dict[str, Any]]:
+    """Stream all KG edges from Neo4j using pagination. Returns rich context including
+    node properties (vulnerability names) and edge properties (signals, sources, reasons)."""
     try:
         from neo4j import GraphDatabase
     except Exception:
-        return []
+        return
 
     uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
     user = os.getenv("NEO4J_USER", "neo4j")
     password = os.getenv("NEO4J_PASSWORD", "").strip()
     if not password:
-        return []
+        _log("Neo4j: NEO4J_PASSWORD not set — skipping KG edge stream")
+        return
 
-    out = []
+    page_size = KG_EDGE_PAGE_SIZE
     try:
         driver = GraphDatabase.driver(uri, auth=(user, password))
-        with driver.session() as s:
-            rows = s.run(
-                """
-                MATCH (a:Vulnerability)-[r:CORRELATED_WITH|CO_OCCURS_WITH]->(b:Vulnerability)
-                RETURN a.vuln_id AS a_id,
-                       b.vuln_id AS b_id,
-                       type(r) AS rel_type,
-                       coalesce(r.max_score, r.max_confidence, 0.0) AS score
-                LIMIT 20000
-                """
-            ).data()
-            out.extend(rows)
+        offset = 0
+        while True:
+            with driver.session() as s:
+                rows = s.run(
+                    """
+                    MATCH (a:Vulnerability)-[r:CORRELATED_WITH|CO_OCCURS_WITH]->(b:Vulnerability)
+                    WHERE (type(r) = 'CORRELATED_WITH' AND coalesce(r.max_score, 0.0) >= $min_corr_score)
+                       OR (type(r) = 'CO_OCCURS_WITH'  AND coalesce(r.max_confidence, 0.0) >= $min_cooc_conf)
+                       OR any(s IN coalesce(r.signals, r.sources, []) WHERE toLower(s) CONTAINS 'cwe')
+                    RETURN a.vuln_id AS a_id,
+                           coalesce(a.vulnerability_name, '') AS a_name,
+                           b.vuln_id AS b_id,
+                           coalesce(b.vulnerability_name, '') AS b_name,
+                           type(r) AS rel_type,
+                           coalesce(r.max_score, r.max_confidence, 0.0) AS score,
+                           coalesce(r.signals, []) AS signals,
+                           coalesce(r.sources, []) AS sources,
+                           coalesce(r.reasons, []) AS reasons
+                    ORDER BY a.vuln_id, b.vuln_id
+                    SKIP $skip LIMIT $limit
+                    """,
+                    skip=offset,
+                    limit=page_size,
+                    min_corr_score=MIN_CORR_SCORE,
+                    min_cooc_conf=MIN_COOC_CONFIDENCE,
+                ).data()
+            if not rows:
+                break
+            for row in rows:
+                yield row
+            if len(rows) < page_size:
+                break
+            offset += len(rows)
         driver.close()
-    except Exception:
-        return []
-    return out
+    except Exception as e:
+        _log(f"Neo4j KG edge stream error: {e}")
+        return
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -360,11 +389,10 @@ def iter_evidence_chunks(data_dir: str | Path = "data") -> Iterator[dict[str, An
     )
     corrs = _safe_json(data_dir / "raw_correlations.json") if ENABLE_CORR else []
     coocs = _safe_json(data_dir / "raw_cooccurrence_v2.json") if ENABLE_COOC else []
-    kg_edges = _kg_edges() if ENABLE_KG_EDGE_CHUNKS else []
-    if kg_edges:
-        _log(f"Loaded {len(kg_edges)} Neo4j graph edges")
+    if ENABLE_KG_EDGE_CHUNKS:
+        _log("Neo4j KG edge stream enabled — will paginate all CORRELATED_WITH/CO_OCCURS_WITH edges")
     else:
-        _log("No Neo4j graph edges loaded")
+        _log("Neo4j KG edge stream disabled")
 
     source_generated = {
         "dataset": 0,
@@ -522,6 +550,8 @@ def iter_evidence_chunks(data_dir: str | Path = "data") -> Iterator[dict[str, An
         b = str(pair.get("cve_b", "")).upper().strip()
         if not a or not b:
             continue
+        if _to_float(pair.get("confidence", 0.0)) < MIN_COOC_CONFIDENCE:
+            continue
         base_text = (
             f"{a} co-occurs with {b}. "
             f"Confidence: {pair.get('confidence', 0.0)}. "
@@ -551,28 +581,42 @@ def iter_evidence_chunks(data_dir: str | Path = "data") -> Iterator[dict[str, An
             )
 
     if ENABLE_KG_EDGE_CHUNKS:
-        _log(f"Processing Neo4j rows: {len(kg_edges)}")
-        for row in kg_edges:
+        _log("Streaming Neo4j KG edges...")
+        kg_edge_count = 0
+        for row in _kg_edges():
             if capped_total:
                 break
             a = str(row.get("a_id", "")).upper().strip()
             b = str(row.get("b_id", "")).upper().strip()
             if not a or not b:
                 continue
-            base_text = (
-                f"{a} has graph edge {row.get('rel_type', '')} with {b}. "
-                f"Score: {row.get('score', 0.0)}."
-            )
+            rel_type = str(row.get("rel_type", "GRAPH_EDGE"))
+            score = row.get("score", 0.0)
+            a_name = str(row.get("a_name", "")).strip()
+            b_name = str(row.get("b_name", "")).strip()
+            signals = row.get("signals") or []
+            sources = row.get("sources") or []
+            reasons = row.get("reasons") or []
+            a_label = f"{a} ({a_name})" if a_name and a_name != a else a
+            b_label = f"{b} ({b_name})" if b_name and b_name != b else b
+            sig_list = signals if signals else sources
+            sig_str = ", ".join(str(s) for s in sig_list[:5]) if sig_list else ""
+            reason_str = "; ".join(str(r) for r in reasons[:2]) if reasons else ""
+            base_text = f"{a_label} {rel_type} {b_label}. Score: {score}."
+            if sig_str:
+                base_text += f" Signals: {sig_str}."
+            if reason_str:
+                base_text += f" {reason_str}"
             for idx, text in enumerate(_split_text(base_text)):
                 chunk = {
-                    "id": f"kg-{_hash(a + b + str(idx) + text)}",
+                    "id": f"kg-{_hash(a + b + rel_type + str(idx) + text)}",
                     "text": text,
-                    "cve_id": b,
+                    "cve_id": a,
                     "target_cve": b,
                     "source_type": "neo4j",
-                    "rel_type": row.get("rel_type", "GRAPH_EDGE"),
-                    "signals": [row.get("rel_type", "")],
-                    "reasons": [],
+                    "rel_type": rel_type,
+                    "signals": _coerce_str_list(sig_list, max_items=8),
+                    "reasons": _coerce_str_list(reasons, max_items=6),
                     "chunk_index": idx,
                 }
                 source_generated["kg"] += 1
@@ -580,6 +624,11 @@ def iter_evidence_chunks(data_dir: str | Path = "data") -> Iterator[dict[str, An
                     yield chunk
                     if capped_total:
                         break
+            kg_edge_count += 1
+            if LOG_EVERY > 0 and kg_edge_count % LOG_EVERY == 0:
+                _log(
+                    f"KG edges progress: {kg_edge_count} edges, emitted={source_emitted['kg']}"
+                )
     else:
         _log("Skipping Neo4j edge chunks via GRAPHRAG_ENABLE_KG_EDGE_CHUNKS=0")
 

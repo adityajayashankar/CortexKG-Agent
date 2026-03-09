@@ -141,7 +141,7 @@ def tool_graphrag_query(arg: str) -> str:
             parsed = json.loads(raw)
             req["query"] = str(parsed.get("query", raw)).strip()
             req["entity"] = parsed.get("entity")
-            req["top_k"] = _clamp_int(int(parsed.get("top_k", 12)), 1, 25)
+            req["top_k"] = _clamp_int(int(parsed.get("top_k", req["top_k"])), 1, 70)
             req["max_hops"] = _clamp_int(int(parsed.get("max_hops", 2)), 1, 3)
             if "use_vector" in parsed:
                 req["use_vector"] = str(parsed.get("use_vector", "")).strip().lower() not in {"0", "false", "no"}
@@ -306,9 +306,11 @@ def tool_likely_on_system(arg: str) -> str:
     results      = []
     direct_count = 0
 
-    # ── Try Neo4j first ───────────────────────────────────────────────────
+    # ── Try Neo4j first (with one auto-reconnect on stale-connection errors) ──
     driver = _get_neo4j_driver()
-    if driver:
+    for _attempt in range(2):
+        if not driver:
+            break
         try:
             with driver.session() as session:
                 # Tier 1: direct graph edges
@@ -330,13 +332,13 @@ def tool_likely_on_system(arg: str) -> str:
                 for row in tier1:
                     raw_conf = float(row["confidence"])
                     results.append({
-                        "cve_id":        row["cve_id"],
-                        "likelihood":    _normalize_likelihood(raw_conf),
+                        "cve_id": row["cve_id"],
+                        "likelihood": _normalize_likelihood(raw_conf),
                         "raw_confidence": round(raw_conf, 3),
                         "evidence_tier": "direct",
-                        "rel_type":      row["rel_type"],
-                        "signals":       list(row["signals"])[:5],
-                        "reasons":       list(row["reasons"])[:3],
+                        "rel_type": row["rel_type"],
+                        "signals": list(row["signals"])[:5],
+                        "reasons": list(row["reasons"])[:3],
                         "inferred_from": [],
                     })
                 direct_count = len(results)
@@ -365,14 +367,13 @@ def tool_likely_on_system(arg: str) -> str:
                         if row["cve_id"] not in seen:
                             cluster_score = min(0.6, float(row["epss"]) * 2 + 0.3)
                             results.append({
-                                "cve_id":        row["cve_id"],
-                                "likelihood":    round(cluster_score, 3),
+                                "cve_id": row["cve_id"],
+                                "likelihood": round(cluster_score, 3),
                                 "raw_confidence": round(cluster_score, 3),
                                 "evidence_tier": "cluster",
-                                "rel_type":      "SAME_CWE_CLUSTER",
-                                "signals":       [f"shared_cwe:{row['shared_cwe']}",
-                                                  f"cluster:{row['cluster_id']}"],
-                                "reasons":       [],
+                                "rel_type": "SAME_CWE_CLUSTER",
+                                "signals": [f"shared_cwe:{row['shared_cwe']}", f"cluster:{row['cluster_id']}"],
+                                "reasons": [],
                                 "inferred_from": [row["shared_cwe"], row["cluster_id"]],
                             })
                             seen.add(row["cve_id"])
@@ -398,21 +399,29 @@ def tool_likely_on_system(arg: str) -> str:
                         if row["cve_id"] not in seen:
                             inferred_score = min(0.4, float(row["epss"]) + 0.2)
                             results.append({
-                                "cve_id":        row["cve_id"],
-                                "likelihood":    round(inferred_score, 3),
+                                "cve_id": row["cve_id"],
+                                "likelihood": round(inferred_score, 3),
                                 "raw_confidence": round(inferred_score, 3),
                                 "evidence_tier": "inferred",
-                                "rel_type":      "SAME_OWASP",
-                                "signals":       [f"owasp:{row['owasp_id']}"],
-                                "reasons":       [],
+                                "rel_type": "SAME_OWASP",
+                                "signals": [f"owasp:{row['owasp_id']}"],
+                                "reasons": [],
                                 "inferred_from": [row["owasp_id"]],
                             })
                             seen.add(row["cve_id"])
 
+            break  # success
         except Exception as e:
             results = []
             direct_count = 0
+            err_str = str(e).lower()
+            if _attempt == 0 and ("closed" in err_str or "connection" in err_str or "unavailable" in err_str):
+                print(f"[tool_likely_on_system] Neo4j session error: {e} — reconnecting...")
+                from pipeline.neo4j_conn import reset_driver
+                driver = reset_driver()
+                continue
             print(f"[tool_likely_on_system] Neo4j query failed: {e} — falling back to JSON")
+            break
 
     # ── JSON file fallback (Neo4j down or no results) ─────────────────────
     if not results:
